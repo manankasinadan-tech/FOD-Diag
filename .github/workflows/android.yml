@@ -22,8 +22,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Configurer Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Préparer Android SDK et accepter les licences
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          sudo mkdir -p "$SDK_ROOT/licenses"
+          sudo chown -R "$(whoami):$(id -gn)" "$SDK_ROOT" || true
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$SDK_ROOT/licenses/android-sdk-preview-license"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          fi
 
       - name: Configurer Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -45,11 +56,8 @@ jobs:
             cp .env.example .env || touch .env
           fi
 
-      - name: Exécuter les tests unitaires
-        run: gradle testDebugUnitTest
-
-      - name: Compiler l'APK Debug
-        run: gradle assembleDebug
+      - name: Exécuter les tests unitaires et compiler l'APK Debug
+        run: gradle testDebugUnitTest assembleDebug --no-daemon
 
       - name: Publier l'artefact APK
         uses: actions/upload-artifact@v4
