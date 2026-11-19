@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">FOD Lab</string>
+    <string name="app_full_title">FOD Lab Intelligence</string>
+    <string name="nav_home">Accueil</string>
+    <string name="nav_dashboard">Tableau de bord</string>
+    <string name="nav_mapping">Cartographie</string>
+    <string name="nav_comparator">Comparateur</string>
+    <string name="nav_settings">Paramètres</string>
+    <string name="cta_launch_analysis">LANCER L’ANALYSE FOD</string>
+    <string name="cta_importer_zip">IMPORTER UNE ARCHIVE .ZIP</string>
+    <string name="cta_export_zip">EXPORTER EN .ZIP</string>
+    <string name="hero_banner_desc">Illustration laboratoire biométrique capteur optique sous écran</string>
+</resources>

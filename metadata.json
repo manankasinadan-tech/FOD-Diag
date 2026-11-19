@@ -1,0 +1,6 @@
+{
+  "name": "FOD Lab Intelligence",
+  "description": "Moteur d'investigation système approfondi et 100 % factuel pour analyser le fonctionnement du lecteur d'empreintes sous écran (FOD) entre ROM d'origine et GSI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
