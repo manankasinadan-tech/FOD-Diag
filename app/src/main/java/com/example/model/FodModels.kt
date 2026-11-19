@@ -158,6 +158,18 @@ data class SnapshotMetadata(
 )
 
 @Immutable
+data class ProtectedAreaMetadata(
+    val path: String,
+    val category: String,
+    val exists: Boolean,
+    val permissions: String,
+    val ownerGroup: String,
+    val seLinuxContext: String,
+    val entryCount: Int,
+    val note: String
+)
+
+@Immutable
 data class FodSnapshot(
     val metadata: SnapshotMetadata,
     val artifacts: List<DiscoveredArtifact>,
@@ -169,7 +181,8 @@ data class FodSnapshot(
     val selinuxFindings: List<SelinuxFinding>,
     val biometricExclusions: List<String>,
     val reportMarkdown: String,
-    val phaseLogs: List<String>
+    val phaseLogs: List<String>,
+    val protectedAreaAudits: List<ProtectedAreaMetadata> = emptyList()
 )
 
 @Immutable
@@ -190,7 +203,9 @@ enum class DiffCategory(val labelFr: String) {
     NOUVEAU_DANS_B("Absent dans A, présent dans B"),
     MODIFIE_SHA256("Modifié (SHA-256 / contenu différent)"),
     PROPRIETE_DIVERGENTE("Propriété / Configuration divergente"),
-    SELINUX_OU_DEPENDANCE("Dépendance ELF / Règle SELinux")
+    SELINUX_OU_DEPENDANCE("Dépendance ELF / Règle SELinux"),
+    HAL_SERVICE_OU_SYSTEME("Service HAL / DEX / Display / Tactile"),
+    BIO_KEYSTORE_TEE("Métadonnées Biométrie / Keystore / TEE")
 }
 
 @Immutable
@@ -206,6 +221,31 @@ data class ComparisonDiffItem(
 )
 
 @Immutable
+data class GsiBlockerVerdict(
+    val id: String,
+    val layer: SystemLayer,
+    val title: String,
+    val statusInA: String,
+    val statusInB: String,
+    val isBlocking: Boolean,
+    val rootCause: String,
+    val evidenceA: String,
+    val evidenceB: String,
+    val imitationSolution: String
+)
+
+@Immutable
+data class GeneratedPatchArtifact(
+    val id: String,
+    val fileName: String,
+    val title: String,
+    val kind: String,
+    val targetPathHint: String,
+    val description: String,
+    val codeContent: String
+)
+
+@Immutable
 data class ComparisonReport(
     val snapshotA: SnapshotMetadata,
     val snapshotB: SnapshotMetadata,
@@ -215,7 +255,13 @@ data class ComparisonReport(
     val propertyDeltaCount: Int,
     val diffs: List<ComparisonDiffItem>,
     val portingChecklistFr: List<String>,
-    val reportMarkdown: String
+    val reportMarkdown: String,
+    val gsiFailureSummary: String = "",
+    val layerVerdicts: List<GsiBlockerVerdict> = emptyList(),
+    val generatedPatches: List<GeneratedPatchArtifact> = emptyList(),
+    val implementationPlanMarkdown: String = "",
+    val deepFindingsCount: Int = 0,
+    val exportedZipPath: String? = null
 )
 
 @Immutable

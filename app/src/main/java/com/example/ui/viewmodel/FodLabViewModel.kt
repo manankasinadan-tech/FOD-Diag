@@ -285,8 +285,50 @@ class FodLabViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update {
                 it.copy(
                     comparisonReport = report,
-                    statusBannerMessage = "Comparaison factuelle générée (${report.diffs.size} écarts analysés)."
+                    statusBannerMessage = "Comparaison factuelle générée (${report.diffs.size} écarts, ${report.generatedPatches.size} patchs proposés)."
                 )
+            }
+        }
+    }
+
+    fun exportComparisonZip(shareAfterExport: Boolean = false) {
+        val state = _uiState.value
+        val report = state.comparisonReport ?: run {
+            _uiState.update { it.copy(errorBannerMessage = "Lancez d'abord une comparaison avant d'exporter le pack .zip.") }
+            return
+        }
+        val snapA = state.snapshots.find { it.metadata.id == report.snapshotA.id }
+        val snapB = state.snapshots.find { it.metadata.id == report.snapshotB.id }
+        if (snapA == null || snapB == null) {
+            _uiState.update { it.copy(errorBannerMessage = "Captures sources introuvables pour générer le pack de comparaison.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusyImportingOrExporting = true, errorBannerMessage = null) }
+            try {
+                val zipFile = dbManager.exportComparisonPackageToZip(report, snapA, snapB)
+                val updatedReport = report.copy(exportedZipPath = zipFile.absolutePath)
+                _uiState.update {
+                    it.copy(
+                        isBusyImportingOrExporting = false,
+                        lastExportedZip = zipFile,
+                        comparisonReport = updatedReport,
+                        statusBannerMessage = "Pack de comparaison & plan d'implémentation exporté : ${zipFile.absolutePath}"
+                    )
+                }
+                if (shareAfterExport) {
+                    _events.emit(LabUiEvent.ShareZipFile(zipFile))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isBusyImportingOrExporting = false,
+                        errorBannerMessage = "Impossible d'exporter le pack de comparaison .zip : ${e.localizedMessage ?: "erreur inconnue"}"
+                    )
+                }
             }
         }
     }

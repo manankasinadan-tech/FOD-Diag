@@ -267,8 +267,11 @@ fun FodLabApp(viewModel: FodLabViewModel) {
                             selectedAId = uiState.selectedSnapshotAId,
                             selectedBId = uiState.selectedSnapshotBId,
                             report = uiState.comparisonReport,
+                            isExporting = uiState.isBusyImportingOrExporting,
                             onSelectSnapshots = { a, b -> viewModel.selectComparisonSnapshots(a, b) },
-                            onRunComparison = { viewModel.runComparison() }
+                            onRunComparison = { viewModel.runComparison() },
+                            onExportComparisonZip = { viewModel.exportComparisonZip(shareAfterExport = false) },
+                            onShareComparisonZip = { viewModel.exportComparisonZip(shareAfterExport = true) }
                         )
                     }
 

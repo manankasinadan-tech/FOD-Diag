@@ -12,6 +12,7 @@ import com.example.model.FodEdge
 import com.example.model.FodNode
 import com.example.model.FodSnapshot
 import com.example.model.NodeStatus
+import com.example.model.ProtectedAreaMetadata
 import com.example.model.RomEnvironmentType
 import com.example.model.SelinuxFinding
 import com.example.model.SeverityLevel
@@ -150,10 +151,19 @@ class FodInvestigationEngine(
                     }
                 }
             }
+            val secServices = shell.exec(
+                "lshal --neat -i -t 2>/dev/null | grep -iE 'keystore|keymint|keymaster|gatekeeper|weaver|tee|qsee|trusty|beanpod|kinibi' | head -n 80; " +
+                    "service list 2>/dev/null | grep -iE 'keystore|gatekeeper|biometric|fingerprint' | head -n 40",
+                preferRoot = true,
+                timeoutMs = 8_000L
+            ).stdout.trim()
+            if (secServices.isNotBlank()) {
+                liveDumps["keystore_gatekeeper_tee_services"] = secServices
+            }
         } else {
             // Sans Root, ne pas exécuter lshal / dumpsys (qui échouent sans permission DUMP et polluent logcat)
             val vintfFallback = shell.exec(
-                "grep -hE 'name>|fqname>|interface' /vendor/etc/vintf/*.xml /vendor/etc/vintf/manifest/*.xml /system/etc/vintf/*.xml 2>/dev/null | grep -iE 'finger|biometric|fod|udfps|display|composer|touch' | head -n 120",
+                "grep -hE 'name>|fqname>|interface' /vendor/etc/vintf/*.xml /vendor/etc/vintf/manifest/*.xml /system/etc/vintf/*.xml 2>/dev/null | grep -iE 'finger|biometric|fod|udfps|display|composer|touch|keystore|keymint|keymaster|gatekeeper|tee' | head -n 140",
                 preferRoot = false,
                 timeoutMs = 6_000L
             ).stdout.trim()
@@ -589,13 +599,13 @@ class FodInvestigationEngine(
         }
 
         val ctxFilesOut = shell.exec(
-            "grep -rnE 'finger|fod|udfps|goodix|fpc|silead|hbm|lhbm|biometric' /vendor/etc/selinux /system/etc/selinux /system_ext/etc/selinux /product/etc/selinux /odm/etc/selinux 2>/dev/null | head -n 100",
+            "grep -rnE 'finger|fod|udfps|goodix|fpc|silead|hbm|lhbm|biometric|fpdata|keystore|keymint|gatekeeper|tee' /vendor/etc/selinux /system/etc/selinux /system_ext/etc/selinux /product/etc/selinux /odm/etc/selinux 2>/dev/null | head -n 140",
             preferRoot = true,
             timeoutMs = 10_000L
         ).stdout
         if (ctxFilesOut.isNotBlank()) {
             liveDumps["selinux_contexts"] = ctxFilesOut
-            ctxFilesOut.lines().take(50).forEach { line ->
+            ctxFilesOut.lines().take(65).forEach { line ->
                 selinuxFindings.add(
                     SelinuxFinding(
                         sourceType = "CONTEXT_POLICY",
@@ -609,15 +619,11 @@ class FodInvestigationEngine(
             }
         }
 
-        // Audit explicite des répertoires biométriques protégés (vérification sans lecture)
-        val protectedDirs = listOf(
-            "/data/vendor_de/0/fpdata",
-            "/data/system/users/0/fpdata",
-            "/mnt/vendor/persist/goodix",
-            "/data/vendor/tee"
-        )
-        protectedDirs.forEach { p ->
-            exclusions.add(BiometricPrivacyGuard.explainExclusion(p))
+        // Audit structurel métadonnées SEULEMENT (permissions, UID/GID, contexte SELinux) sur zones biométriques/keystore/TEE
+        // Aucun contenu de gabarit d'empreinte ni de clé privée n'est jamais lu.
+        val protectedAreaAudits = auditProtectedAreaMetadata(rootInfo.isGranted)
+        protectedAreaAudits.forEach { area ->
+            exclusions.add("${BiometricPrivacyGuard.explainExclusion(area.path)} [Métadonnées : exists=${area.exists}, perms=${area.permissions}, owner=${area.ownerGroup}, ctx=${area.seLinuxContext}]")
         }
 
         // ── PHASE 8 : CORRÉLATION FACTUELLE, GRAPHE & RAPPORT COMPLET ─────────────────
@@ -670,7 +676,8 @@ class FodInvestigationEngine(
             anomalies = anomalies,
             selinuxFindings = selinuxFindings,
             liveDumps = liveDumps,
-            exclusions = exclusions
+            exclusions = exclusions,
+            protectedAreaAudits = protectedAreaAudits
         )
 
         onProgress(
@@ -695,7 +702,8 @@ class FodInvestigationEngine(
             selinuxFindings = selinuxFindings,
             biometricExclusions = exclusions.distinct(),
             reportMarkdown = reportMd,
-            phaseLogs = logs.toList()
+            phaseLogs = logs.toList(),
+            protectedAreaAudits = protectedAreaAudits
         )
     }
 
@@ -955,7 +963,8 @@ class FodInvestigationEngine(
         anomalies: List<FodAnomaly>,
         selinuxFindings: List<SelinuxFinding>,
         liveDumps: Map<String, String>,
-        exclusions: List<String>
+        exclusions: List<String>,
+        protectedAreaAudits: List<ProtectedAreaMetadata>
     ): String {
         val sb = StringBuilder()
         sb.appendLine("# RAPPORT COMPLET D'INVESTIGATION FOD — FOD LAB INTELLIGENCE")
@@ -1087,7 +1096,15 @@ class FodInvestigationEngine(
             }
         }
 
-        sb.appendLine("## 8. Journal de protection des données biométriques")
+        sb.appendLine("## 8. Audit structurel Biométrie / Keystore / TEE (métadonnées sans lecture de secrets)")
+        if (protectedAreaAudits.isEmpty()) {
+            sb.appendLine("- Aucune métadonnée de zone protégée collectée.")
+        } else {
+            protectedAreaAudits.forEach { a ->
+                sb.appendLine("- `${a.path}` (${a.category}) : existe=`${a.exists}` | perms=`${a.permissions}` | owner=`${a.ownerGroup}` | SELinux=`${a.seLinuxContext}` | entrées=`${a.entryCount}` — ${a.note}")
+            }
+        }
+        sb.appendLine()
         exclusions.distinct().forEach { sb.appendLine("- $it") }
 
         return sb.toString()
@@ -1251,6 +1268,66 @@ class FodInvestigationEngine(
         }
         flushIfRelevant()
         return out.toString().trim()
+    }
+
+    private suspend fun auditProtectedAreaMetadata(rootGranted: Boolean): List<ProtectedAreaMetadata> {
+        val targets = listOf(
+            "/data/vendor_de/0/fpdata" to "STOCKAGE_BIOMETRIQUE",
+            "/data/system/users/0/fpdata" to "STOCKAGE_BIOMETRIQUE",
+            "/data/vendor/fingerprint" to "STOCKAGE_BIOMETRIQUE",
+            "/data/misc/keystore" to "KEYSTORE",
+            "/data/vendor/keystore" to "KEYSTORE",
+            "/mnt/vendor/persist/goodix" to "PERSIST_CALIBRATION",
+            "/mnt/vendor/persist/fpc" to "PERSIST_CALIBRATION",
+            "/mnt/vendor/persist/silead" to "PERSIST_CALIBRATION",
+            "/mnt/vendor/persist/biometrics" to "PERSIST_CALIBRATION",
+            "/data/vendor/tee" to "TEE_ENVIRONNEMENT",
+            "/dev/qseecom" to "NOEUD_TEE",
+            "/dev/tee0" to "NOEUD_TEE",
+            "/dev/goodix_fp" to "NOEUD_CAPTEUR",
+            "/dev/esfp0" to "NOEUD_CAPTEUR"
+        )
+        val audits = mutableListOf<ProtectedAreaMetadata>()
+        for ((path, category) in targets) {
+            val q = RootShellExecutor.shellQuote(path)
+            val cmd = "if [ -e $q ]; then ls -ldZ $q 2>/dev/null; stat -c '%a|%U:%G' $q 2>/dev/null; if [ -d $q ]; then ls -1A $q 2>/dev/null | wc -l; else echo 1; fi; else echo MISSING; fi"
+            val out = shell.exec(cmd, preferRoot = rootGranted, timeoutMs = 4_000L).stdout.trim()
+            val lines = out.lines().map { it.trim() }.filter { it.isNotBlank() }
+            if (lines.isEmpty() || lines.first() == "MISSING") {
+                audits.add(
+                    ProtectedAreaMetadata(
+                        path = path,
+                        category = category,
+                        exists = false,
+                        permissions = "-",
+                        ownerGroup = "-",
+                        seLinuxContext = "-",
+                        entryCount = 0,
+                        note = if (rootGranted) "Chemin absent sur ce système" else "Absent ou masqué sans Root"
+                    )
+                )
+            } else {
+                val lsLine = lines.getOrNull(0).orEmpty()
+                val (lsPerms, seCtx) = DeviceTreeAndSysfsProbe.parseLsZ(lsLine)
+                val statParts = lines.getOrNull(1)?.split('|').orEmpty()
+                val octalPerms = statParts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: lsPerms
+                val ownerGrp = statParts.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "?"
+                val count = lines.getOrNull(2)?.toIntOrNull() ?: 0
+                audits.add(
+                    ProtectedAreaMetadata(
+                        path = path,
+                        category = category,
+                        exists = true,
+                        permissions = "$lsPerms ($octalPerms)",
+                        ownerGroup = ownerGrp,
+                        seLinuxContext = seCtx,
+                        entryCount = count,
+                        note = "Audit métadonnées uniquement (contenu biométrique/clé non lu)"
+                    )
+                )
+            }
+        }
+        return audits
     }
 
     private fun sha256Text(text: String): String {

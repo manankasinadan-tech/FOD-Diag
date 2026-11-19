@@ -3,6 +3,7 @@ package com.example.core
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
+import com.example.model.ComparisonReport
 import com.example.model.DeviceTreeNode
 import com.example.model.DexRroAnalysis
 import com.example.model.DiscoveredArtifact
@@ -12,6 +13,7 @@ import com.example.model.FodEdge
 import com.example.model.FodNode
 import com.example.model.FodSnapshot
 import com.example.model.NodeStatus
+import com.example.model.ProtectedAreaMetadata
 import com.example.model.RomEnvironmentType
 import com.example.model.SelinuxFinding
 import com.example.model.SeverityLevel
@@ -21,6 +23,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -148,6 +153,20 @@ class FodDatabaseManager(
         updatedSnapshot.properties.forEach { (k, v) -> propsObj.put(k, v) }
         val exclArr = JSONArray(updatedSnapshot.biometricExclusions)
         val logsArr = JSONArray(updatedSnapshot.phaseLogs)
+        val areaArr = JSONArray()
+        updatedSnapshot.protectedAreaAudits.forEach { a ->
+            areaArr.put(
+                JSONObject()
+                    .put("path", a.path)
+                    .put("category", a.category)
+                    .put("exists", a.exists)
+                    .put("permissions", a.permissions)
+                    .put("ownerGroup", a.ownerGroup)
+                    .put("seLinuxContext", a.seLinuxContext)
+                    .put("entryCount", a.entryCount)
+                    .put("note", a.note)
+            )
+        }
 
         File(snapDir, "anomalies_et_diagnostics.json").writeText(
             JSONObject()
@@ -156,6 +175,7 @@ class FodDatabaseManager(
                 .put("proprietes", propsObj)
                 .put("exclusions_biometriques", exclArr)
                 .put("journaux_phases", logsArr)
+                .put("audit_zones_protegees", areaArr)
                 .toString(2)
         )
 
@@ -295,6 +315,145 @@ class FodDatabaseManager(
         val updatedMeta = snapshot.metadata.copy(zipExportPath = zipFile.absolutePath)
         File(ensuredSource, "manifest_snapshot.json").writeText(serializeMetadata(updatedMeta).toString(2))
         zipFile
+    }
+
+    suspend fun exportComparisonPackageToZip(
+        report: ComparisonReport,
+        snapA: FodSnapshot,
+        snapB: FodSnapshot
+    ): File = withContext(Dispatchers.IO) {
+        val dbRoot = getActiveDatabaseDir()
+        val exportsDir = File(dbRoot, "Exports").apply { mkdirs() }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val folderName = "PLAN_PORTAGE_FOD_$stamp"
+        val stagingDir = File(exportsDir, folderName).apply { mkdirs() }
+
+        try {
+            // 1. Rapports Markdown & Plan d'implémentation
+            File(stagingDir, "RAPPORT_COMPARAISON_COMPLET.md").writeText(report.reportMarkdown)
+            File(stagingDir, "PLAN_IMPLEMENTATION_FOD.md").writeText(
+                report.implementationPlanMarkdown.ifBlank { report.reportMarkdown }
+            )
+
+            // 2. comparison_data.json
+            val verdictsArr = JSONArray()
+            report.layerVerdicts.forEach { v ->
+                verdictsArr.put(
+                    JSONObject()
+                        .put("id", v.id)
+                        .put("layer", v.layer.name)
+                        .put("title", v.title)
+                        .put("statusInA", v.statusInA)
+                        .put("statusInB", v.statusInB)
+                        .put("isBlocking", v.isBlocking)
+                        .put("rootCause", v.rootCause)
+                        .put("evidenceA", v.evidenceA)
+                        .put("evidenceB", v.evidenceB)
+                        .put("imitationSolution", v.imitationSolution)
+                )
+            }
+            val patchesArr = JSONArray()
+            report.generatedPatches.forEach { p ->
+                patchesArr.put(
+                    JSONObject()
+                        .put("id", p.id)
+                        .put("fileName", p.fileName)
+                        .put("title", p.title)
+                        .put("kind", p.kind)
+                        .put("targetPathHint", p.targetPathHint)
+                        .put("description", p.description)
+                        .put("codeContent", p.codeContent)
+                )
+            }
+            val diffsArr = JSONArray()
+            report.diffs.forEach { d ->
+                diffsArr.put(
+                    JSONObject()
+                        .put("id", d.id)
+                        .put("category", d.category.name)
+                        .put("layer", d.layer.name)
+                        .put("severity", d.severity.name)
+                        .put("keyOrPath", d.keyOrPath)
+                        .put("valueA", d.valueA)
+                        .put("valueB", d.valueB)
+                        .put("portingNote", d.portingNote)
+                )
+            }
+            File(stagingDir, "comparison_data.json").writeText(
+                JSONObject()
+                    .put("snapshotA", serializeMetadata(report.snapshotA))
+                    .put("snapshotB", serializeMetadata(report.snapshotB))
+                    .put("criticalBlockersCount", report.criticalBlockersCount)
+                    .put("missingInBCount", report.missingInBCount)
+                    .put("modifiedShaCount", report.modifiedShaCount)
+                    .put("propertyDeltaCount", report.propertyDeltaCount)
+                    .put("deepFindingsCount", report.deepFindingsCount)
+                    .put("gsiFailureSummary", report.gsiFailureSummary)
+                    .put("portingChecklistFr", JSONArray(report.portingChecklistFr))
+                    .put("layerVerdicts", verdictsArr)
+                    .put("generatedPatches", patchesArr)
+                    .put("diffs", diffsArr)
+                    .toString(2)
+            )
+
+            // 3. patchs_proposes/*
+            val patchDir = File(stagingDir, "patchs_proposes").apply { mkdirs() }
+            report.generatedPatches.forEach { p ->
+                val cleanName = p.fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                if (cleanName.isNotBlank()) {
+                    File(patchDir, cleanName).writeText(p.codeContent)
+                }
+            }
+
+            // 4. fichiers_a_porter_de_A/ et quasi_code_source_A/ (uniquement non-sensibles manquants/divergents)
+            val snapADir = File(snapA.metadata.snapshotDirPath)
+            val mapB = snapB.artifacts.associateBy { it.path }
+            val portFilesDir = File(stagingDir, "fichiers_a_porter_de_A").apply { mkdirs() }
+            val portPseudoDir = File(stagingDir, "quasi_code_source_A").apply { mkdirs() }
+            var copiedBytes = 0L
+            val maxCopyBytes = 120L * 1024L * 1024L
+
+            for (artA in snapA.artifacts) {
+                if (BiometricPrivacyGuard.isProtectedBiometricPath(artA.path)) continue
+                val artB = mapB[artA.path]
+                val needsPort = artB == null || (artA.sha256 != artB.sha256 && artA.sha256 != "INDISPONIBLE")
+                if (!needsPort) continue
+
+                artA.extractedRelativePath?.let { rel ->
+                    if (copiedBytes < maxCopyBytes) {
+                        val src = File(snapADir, rel)
+                        if (src.exists() && src.isFile) {
+                            val cleanRel = rel.removePrefix("fichiers_extraits/").trimStart('/')
+                            if (!cleanRel.contains("..")) {
+                                val dst = File(portFilesDir, cleanRel)
+                                dst.parentFile?.mkdirs()
+                                src.copyTo(dst, overwrite = true)
+                                copiedBytes += dst.length()
+                            }
+                        }
+                    }
+                }
+                artA.pseudoSourcePath?.let { rel ->
+                    val src = File(snapADir, rel)
+                    if (src.exists() && src.isFile) {
+                        val cleanRel = rel.removePrefix("quasi_code_source/").trimStart('/')
+                        if (!cleanRel.contains("..")) {
+                            val dst = File(portPseudoDir, cleanRel)
+                            dst.parentFile?.mkdirs()
+                            src.copyTo(dst, overwrite = true)
+                        }
+                    }
+                }
+            }
+
+            val zipFile = File(exportsDir, "COMPARAISON_FOD_${stamp}.zip")
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
+                zipFolderRecursive(stagingDir, stagingDir.name, zos)
+            }
+            zipFile
+        } finally {
+            stagingDir.deleteRecursively()
+        }
     }
 
     suspend fun importZipFromUri(uri: Uri): Result<FodSnapshot> = withContext(Dispatchers.IO) {
@@ -457,6 +616,7 @@ class FodDatabaseManager(
         val props = LinkedHashMap<String, String>()
         val exclusions = mutableListOf<String>()
         val phaseLogs = mutableListOf<String>()
+        val protectedAudits = mutableListOf<ProtectedAreaMetadata>()
 
         val diagFile = File(dir, "anomalies_et_diagnostics.json")
         if (diagFile.exists()) {
@@ -496,6 +656,22 @@ class FodDatabaseManager(
             for (i in 0 until exArr.length()) exclusions.add(exArr.getString(i))
             val lArr = obj.optJSONArray("journaux_phases") ?: JSONArray()
             for (i in 0 until lArr.length()) phaseLogs.add(lArr.getString(i))
+            val areaArr = obj.optJSONArray("audit_zones_protegees") ?: JSONArray()
+            for (i in 0 until areaArr.length()) {
+                val ar = areaArr.getJSONObject(i)
+                protectedAudits.add(
+                    ProtectedAreaMetadata(
+                        path = ar.optString("path"),
+                        category = ar.optString("category"),
+                        exists = ar.optBoolean("exists", false),
+                        permissions = ar.optString("permissions", "-"),
+                        ownerGroup = ar.optString("ownerGroup", "-"),
+                        seLinuxContext = ar.optString("seLinuxContext", "-"),
+                        entryCount = ar.optInt("entryCount", 0),
+                        note = ar.optString("note")
+                    )
+                )
+            }
         }
 
         val liveDumps = LinkedHashMap<String, String>()
@@ -521,7 +697,8 @@ class FodDatabaseManager(
             selinuxFindings = selinux,
             biometricExclusions = exclusions,
             reportMarkdown = reportMd,
-            phaseLogs = phaseLogs
+            phaseLogs = phaseLogs,
+            protectedAreaAudits = protectedAudits
         )
     }.getOrNull()
 

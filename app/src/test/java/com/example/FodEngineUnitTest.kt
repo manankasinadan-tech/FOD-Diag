@@ -3,10 +3,14 @@ package com.example
 import com.example.core.BiometricPrivacyGuard
 import com.example.core.ElfAnalyzer
 import com.example.core.FodComparatorEngine
+import com.example.model.DexRroAnalysis
+import com.example.model.DiffCategory
 import com.example.model.DiscoveredArtifact
 import com.example.model.ElfAnalysis
 import com.example.model.FodSnapshot
+import com.example.model.ProtectedAreaMetadata
 import com.example.model.RomEnvironmentType
+import com.example.model.SelinuxFinding
 import com.example.model.SnapshotMetadata
 import com.example.model.SystemLayer
 import org.junit.Assert.assertEquals
@@ -53,12 +57,6 @@ class FodEngineUnitTest {
         val offExportSym = dynstrText.indexOf("_ZN6vendor6goodix14FingerprintHal12onFingerDownEv")
         val offImportSym = dynstrText.indexOf("ioctl")
 
-        // Build minimal ELF64 LE:
-        // 0..64: ELF64 header
-        // 64..128: .dynamic (4 entries * 16 bytes: DT_NEEDED x2, DT_SONAME, DT_NULL)
-        // 128..200: .dynsym (3 entries * 24 bytes: NULL, export, import)
-        // 200..200+dynstrBytes.size: .dynstr
-        // shoff = 200 + dynstrBytes.size (4 sections * 64 bytes)
         val dynOff = 64
         val dynSize = 64
         val symOff = 128
@@ -69,41 +67,35 @@ class FodEngineUnitTest {
         val totalSize = shOff + 4 * 64
 
         val buf = java.nio.ByteBuffer.allocate(totalSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        // ELF magic + 64-bit LE
         buf.put(0, 0x7F.toByte())
         buf.put(1, 'E'.code.toByte())
         buf.put(2, 'L'.code.toByte())
         buf.put(3, 'F'.code.toByte())
-        buf.put(4, 2.toByte()) // ELFCLASS64
-        buf.put(5, 1.toByte()) // ELFDATA2LSB
-        buf.putShort(18, 0xB7.toShort()) // EM_AARCH64
+        buf.put(4, 2.toByte())
+        buf.put(5, 1.toByte())
+        buf.putShort(18, 0xB7.toShort())
         buf.putLong(40, shOff.toLong())
         buf.putShort(58, 64.toShort())
         buf.putShort(60, 4.toShort())
 
-        // .dynamic entries
-        buf.putLong(dynOff, 1L) // DT_NEEDED
+        buf.putLong(dynOff, 1L)
         buf.putLong(dynOff + 8, offLibGf.toLong())
-        buf.putLong(dynOff + 16, 1L) // DT_NEEDED
+        buf.putLong(dynOff + 16, 1L)
         buf.putLong(dynOff + 24, offMissing.toLong())
-        buf.putLong(dynOff + 32, 14L) // DT_SONAME
+        buf.putLong(dynOff + 32, 14L)
         buf.putLong(dynOff + 40, offSoName.toLong())
-        buf.putLong(dynOff + 48, 0L) // DT_NULL
+        buf.putLong(dynOff + 48, 0L)
 
-        // .dynsym entry 1: exported FOD C++ symbol (st_shndx = 1, STT_FUNC = 2)
         buf.putInt(symOff + 24, offExportSym)
-        buf.put(symOff + 24 + 4, 0x12.toByte()) // STB_GLOBAL | STT_FUNC
+        buf.put(symOff + 24 + 4, 0x12.toByte())
         buf.putShort(symOff + 24 + 6, 1.toShort())
 
-        // .dynsym entry 2: imported ioctl (st_shndx = 0, STT_FUNC = 2)
         buf.putInt(symOff + 48, offImportSym)
         buf.put(symOff + 48 + 4, 0x12.toByte())
         buf.putShort(symOff + 48 + 6, 0.toShort())
 
-        // .dynstr bytes
         System.arraycopy(dynstrBytes, 0, buf.array(), strOff, strSize)
 
-        // Section headers: [0]=NULL, [1]=.dynstr (type=3), [2]=.dynamic (type=6, link=1), [3]=.dynsym (type=11, link=1)
         val sh1 = shOff + 64
         buf.putInt(sh1 + 4, 3)
         buf.putLong(sh1 + 24, strOff.toLong())
@@ -218,11 +210,151 @@ class FodEngineUnitTest {
         assertTrue(report.portingChecklistFr.any { it.contains("libgf_hal.so") })
     }
 
+    @Test
+    fun comparatorEngine_generatesGsiVerdictsPatchesPlanAndProtectedAreaAudit() {
+        val snapStock = createTestSnapshot(
+            id = "STOCK_DEEP",
+            romType = RomEnvironmentType.ROM_ORIGINE,
+            artifacts = listOf(
+                DiscoveredArtifact(
+                    id = "s_rro",
+                    path = "/vendor/overlay/UdfpsOverlay.apk",
+                    layer = SystemLayer.FRAMEWORK,
+                    kind = "Overlay RRO",
+                    sha256 = "rro_stock",
+                    sizeBytes = 4096,
+                    permissions = "-rw-r--r--",
+                    seLinuxContext = "u:object_r:vendor_overlay_file:s0",
+                    summary = "RRO UDFPS Stock",
+                    isOemPatch = true,
+                    dexRroAnalysis = DexRroAnalysis(
+                        sourcePath = "/vendor/overlay/UdfpsOverlay.apk",
+                        packageName = "com.oem.udfps.overlay",
+                        rroTargetPackage = "com.android.systemui",
+                        rroPriority = 900,
+                        matchedClasses = listOf("com.android.systemui.biometrics.UdfpsController"),
+                        matchedMethods = listOf("onFingerDown"),
+                        matchedConfigKeys = listOf("config_udfps_sensor_props", "config_dozeAfterScreenOff"),
+                        udfpsProperties = mapOf("config_udfps_sensor_props" to "540,2100,95")
+                    )
+                ),
+                DiscoveredArtifact(
+                    id = "s_hbm",
+                    path = "/sys/class/drm/card0-DSI-1/hbm",
+                    layer = SystemLayer.DISPLAY,
+                    kind = "Noeud sysfs HBM",
+                    sha256 = "hbm1",
+                    sizeBytes = 8,
+                    permissions = "-rw-rw-r--",
+                    seLinuxContext = "u:object_r:sysfs_graphics:s0",
+                    summary = "Sysfs HBM",
+                    rawExcerpt = "0"
+                )
+            ),
+            props = mapOf(
+                "persist.vendor.sys.fp.fod.location.X_Y" to "540,2100",
+                "ro.hardware.fingerprint" to "goodix"
+            ),
+            liveDumps = mapOf(
+                "hal_services_lshal_dumpsys" to "vendor.goodix.hardware.biometrics.fingerprint@2.1::IGoodixFingerprintDaemon/default\nandroid.hardware.biometrics.fingerprint@2.3::IBiometricsFingerprint/default",
+                "keystore_gatekeeper_tee_services" to "android.system.keystore2.IKeystoreService/default\nandroid.hardware.security.keymint.IKeyMintDevice/default\nandroid.hardware.gatekeeper.IGatekeeper/default"
+            ),
+            protectedAreaAudits = listOf(
+                ProtectedAreaMetadata(
+                    path = "/data/vendor_de/0/fpdata",
+                    category = "Gabarits biométriques",
+                    exists = true,
+                    permissions = "drwx------",
+                    ownerGroup = "1000:1000",
+                    seLinuxContext = "u:object_r:fingerprint_vendor_data_file:s0",
+                    entryCount = 2,
+                    note = "Métadonnées uniquement"
+                ),
+                ProtectedAreaMetadata(
+                    path = "/data/misc/keystore",
+                    category = "Keystore",
+                    exists = true,
+                    permissions = "drwx------",
+                    ownerGroup = "1017:1017",
+                    seLinuxContext = "u:object_r:keystore_data_file:s0",
+                    entryCount = 3,
+                    note = "Métadonnées uniquement"
+                )
+            )
+        )
+
+        val snapGsi = createTestSnapshot(
+            id = "GSI_DEEP",
+            romType = RomEnvironmentType.GSI_DSU,
+            artifacts = emptyList(),
+            props = mapOf("ro.gsid.image_running" to "1"),
+            liveDumps = mapOf(
+                "hal_services_lshal_dumpsys" to "android.hardware.biometrics.fingerprint@2.1::IBiometricsFingerprint/default",
+                "keystore_gatekeeper_tee_services" to "android.system.keystore2.IKeystoreService/default"
+            ),
+            selinuxFindings = listOf(
+                SelinuxFinding(
+                    sourceType = "AVC_DENIED",
+                    rawLine = "avc: denied { read write } for comm=\"fingerprint\" scontext=u:r:hal_fingerprint_default:s0 tcontext=u:object_r:sysfs_graphics:s0 tclass=file",
+                    domain = "hal_fingerprint_default",
+                    targetType = "sysfs_graphics",
+                    tclass = "file",
+                    permission = "read"
+                )
+            ),
+            protectedAreaAudits = listOf(
+                ProtectedAreaMetadata(
+                    path = "/data/vendor_de/0/fpdata",
+                    category = "Gabarits biométriques",
+                    exists = false,
+                    permissions = "-",
+                    ownerGroup = "-",
+                    seLinuxContext = "-",
+                    entryCount = 0,
+                    note = "Absent dans GSI"
+                ),
+                ProtectedAreaMetadata(
+                    path = "/data/misc/keystore",
+                    category = "Keystore",
+                    exists = true,
+                    permissions = "drwx------",
+                    ownerGroup = "1017:1017",
+                    seLinuxContext = "u:object_r:unlabeled:s0",
+                    entryCount = 0,
+                    note = "Contexte SELinux dégradé"
+                )
+            )
+        )
+
+        val report = FodComparatorEngine.compare(snapStock, snapGsi)
+        assertTrue(report.gsiFailureSummary.contains("Pourquoi le FOD échoue") || report.gsiFailureSummary.isNotBlank())
+        assertEquals(SystemLayer.entries.size, report.layerVerdicts.size)
+        assertTrue(report.layerVerdicts.any { it.isBlocking && it.imitationSolution.isNotBlank() })
+        assertTrue(report.diffs.any { it.category == DiffCategory.BIO_KEYSTORE_TEE })
+        assertTrue(report.diffs.any { it.category == DiffCategory.HAL_SERVICE_OU_SYSTEME })
+
+        val patchFiles = report.generatedPatches.map { it.fileName }
+        assertTrue(patchFiles.contains("fod_sepolicy_gsi.te"))
+        assertTrue(patchFiles.contains("fod_system_props.prop"))
+        assertTrue(patchFiles.contains("fod_rro_overlay_config.xml"))
+        assertTrue(patchFiles.contains("fod_init_overlay.rc"))
+        assertTrue(report.implementationPlanMarkdown.contains("PLAN D'IMPLÉMENTATION"))
+
+        val sepolicyPatch = report.generatedPatches.first { it.fileName == "fod_sepolicy_gsi.te" }.codeContent
+        assertTrue(sepolicyPatch.contains("allow hal_fingerprint_default sysfs_graphics:file { read };"))
+        val initPatch = report.generatedPatches.first { it.fileName == "fod_init_overlay.rc" }.codeContent
+        assertTrue(initPatch.contains("/data/vendor_de/0/fpdata"))
+        assertTrue(initPatch.contains("restorecon_recursive /data/misc/keystore"))
+    }
+
     private fun createTestSnapshot(
         id: String,
         romType: RomEnvironmentType,
         artifacts: List<DiscoveredArtifact>,
-        props: Map<String, String>
+        props: Map<String, String>,
+        liveDumps: Map<String, String> = emptyMap(),
+        selinuxFindings: List<SelinuxFinding> = emptyList(),
+        protectedAreaAudits: List<ProtectedAreaMetadata> = emptyList()
     ): FodSnapshot {
         return FodSnapshot(
             metadata = SnapshotMetadata(
@@ -253,11 +385,12 @@ class FodEngineUnitTest {
             edges = emptyList(),
             anomalies = emptyList(),
             properties = props,
-            liveDumps = emptyMap(),
-            selinuxFindings = emptyList(),
+            liveDumps = liveDumps,
+            selinuxFindings = selinuxFindings,
             biometricExclusions = emptyList(),
             reportMarkdown = "# Rapport",
-            phaseLogs = emptyList()
+            phaseLogs = emptyList(),
+            protectedAreaAudits = protectedAreaAudits
         )
     }
 }
