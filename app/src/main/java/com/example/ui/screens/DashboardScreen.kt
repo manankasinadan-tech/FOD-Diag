@@ -152,6 +152,8 @@ fun DashboardScreen(
                             }
                         }
 
+                        val extractedCount = snapshot.artifacts.count { it.extractedRelativePath != null }
+                        val pseudoCount = snapshot.artifacts.count { it.pseudoSourcePath != null }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             StatusPillBadge(
                                 label = "${snapshot.artifacts.size} artefacts",
@@ -166,6 +168,11 @@ fun DashboardScreen(
                                 color = AmberWarning
                             )
                         }
+                        Text(
+                            text = "Extraits dans fichiers_extraits/ : $extractedCount fichiers • Quasi-code source : $pseudoCount fichiers (.cpp/.java/.xml/.dtsi/.rc)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EmeraldVerified
+                        )
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),

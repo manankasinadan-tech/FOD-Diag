@@ -25,13 +25,13 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
             .filter { it.length >= 3 }
             .joinToString("|") { Regex.escape(it) }
 
-        val findCmd = "find /proc/device-tree -maxdepth 5 -type d 2>/dev/null | grep -iE '$kwPattern' | head -n 45"
-        val dirsRes = shell.exec(findCmd, preferRoot = true, timeoutMs = 12_000L)
+        val findCmd = "if [ -r /proc/device-tree ] || [ \$(id -u) -eq 0 ]; then find /proc/device-tree -maxdepth 6 -type d 2>/dev/null | grep -iE '$kwPattern' | head -n 75; fi"
+        val dirsRes = shell.exec(findCmd, preferRoot = true, timeoutMs = 14_000L)
         val dirs = dirsRes.stdout.lines().map { it.trim() }.filter { it.startsWith("/proc/device-tree") }.distinct()
 
         val nodes = mutableListOf<DeviceTreeNode>()
         for (dir in dirs) {
-            val propsRes = shell.exec("ls -1 ${RootShellExecutor.shellQuote(dir)} 2>/dev/null | head -n 30", preferRoot = true, timeoutMs = 4_000L)
+            val propsRes = shell.exec("ls -1 ${RootShellExecutor.shellQuote(dir)} 2>/dev/null | head -n 45", preferRoot = true, timeoutMs = 4_000L)
             val propNames = propsRes.stdout.lines().map { it.trim() }.filter { it.isNotBlank() }
             val propMap = LinkedHashMap<String, String>()
             var compatible: String? = null
@@ -40,25 +40,49 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
                 val propPath = "$dir/$prop"
                 val bytes = shell.readFileBytesSafe(propPath, maxBytes = 4096, preferRoot = true) ?: continue
                 if (bytes.isEmpty()) {
-                    propMap[prop] = "<présent / booléen>"
+                    propMap[prop] = "<booléen>"
                     continue
                 }
-                val decoded = decodeFdtValue(prop, bytes)
+                val decoded = decodeFdtValue(bytes)
                 propMap[prop] = decoded
                 if (prop == "compatible") compatible = decoded
             }
             if (propMap.isNotEmpty()) {
-                nodes.add(DeviceTreeNode(nodePath = dir, compatible = compatible, properties = propMap))
+                val dtsi = buildPseudoDtsi(dir, propMap)
+                nodes.add(
+                    DeviceTreeNode(
+                        nodePath = dir,
+                        compatible = compatible,
+                        properties = propMap,
+                        pseudoDtsi = dtsi
+                    )
+                )
             }
         }
         return nodes
+    }
+
+    private fun buildPseudoDtsi(nodePath: String, props: Map<String, String>): String {
+        val nodeName = nodePath.substringAfterLast('/').ifBlank { "dt_node" }
+        val sb = StringBuilder()
+        sb.appendLine("// Source reconstruit depuis $nodePath")
+        sb.appendLine("$nodeName {")
+        props.forEach { (k, v) ->
+            when {
+                v == "<booléen>" -> sb.appendLine("    $k;")
+                v.startsWith("0x") -> sb.appendLine("    $k = <$v>;")
+                else -> sb.appendLine("    $k = \"$v\";")
+            }
+        }
+        sb.appendLine("};")
+        return sb.toString()
     }
 
     suspend fun probeSysfsAndDev(dynamicKeywords: Set<String>): List<SysfsDiscoveredNode> {
         val extraTokens = dynamicKeywords
             .map { it.lowercase().replace(Regex("[^a-z0-9_.-]"), "") }
             .filter { it.length >= 4 }
-            .take(15)
+            .take(18)
         val tokens = (listOf(
             "finger", "fod", "udfps", "goodix", "fpc", "silead", "egistec",
             "hbm", "lhbm", "disp_param", "doze", "dim", "touch", "input",
@@ -69,13 +93,13 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
         val cmd = """
             for root in /sys/class /sys/devices/platform /sys/devices/virtual /sys/bus/spi/devices /sys/bus/i2c/devices /dev; do
               if [ -e "${'$'}root" ]; then
-                find "${'$'}root" -maxdepth 4 2>/dev/null | grep -iE '$grepExpr' | head -n 45
+                find "${'$'}root" -maxdepth 5 2>/dev/null | grep -iE '$grepExpr' | head -n 85
               fi
             done
         """.trimIndent()
 
-        val res = shell.exec(cmd, preferRoot = true, timeoutMs = 15_000L)
-        val candidatePaths = res.stdout.lines().map { it.trim() }.filter { it.startsWith("/") }.distinct().take(110)
+        val res = shell.exec(cmd, preferRoot = true, timeoutMs = 16_000L)
+        val candidatePaths = res.stdout.lines().map { it.trim() }.filter { it.startsWith("/") }.distinct().take(180)
 
         val discovered = mutableListOf<SysfsDiscoveredNode>()
         for (path in candidatePaths) {
@@ -85,14 +109,13 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
                 .stdout.trim()
             val (perms, selinux) = parseLsZ(statLine)
 
-            // Lecture non-destructive uniquement pour les fichiers réguliers petits
             val valueStr = if (!path.startsWith("/dev/")) {
                 val valRes = shell.exec(
                     "if [ -f ${RootShellExecutor.shellQuote(path)} ] && [ -r ${RootShellExecutor.shellQuote(path)} ]; then head -c 512 ${RootShellExecutor.shellQuote(path)} 2>/dev/null | tr '\\0' ' '; fi",
                     preferRoot = true,
                     timeoutMs = 2_500L
                 )
-                valRes.stdout.trim().take(240)
+                valRes.stdout.trim().take(280)
             } else {
                 "<nœud périphérique caractère/bloc>"
             }
@@ -119,7 +142,7 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
         return discovered
     }
 
-    private fun decodeFdtValue(propName: String, bytes: ByteArray): String {
+    private fun decodeFdtValue(bytes: ByteArray): String {
         val looksLikeStrings = bytes.lastOrNull() == 0.toByte() &&
             bytes.count { it in 32..126 || it == 0.toByte() } >= (bytes.size * 0.85)
         if (looksLikeStrings) {
@@ -133,7 +156,7 @@ class DeviceTreeAndSysfsProbe(private val shell: RootShellExecutor) {
             val ints = mutableListOf<String>()
             for (i in 0 until bytes.size / 4) {
                 val v = buf.getInt(i * 4)
-                ints.add("0x${(v.toLong() and 0xFFFFFFFFL).toString(16)} ($v)")
+                ints.add("0x${(v.toLong() and 0xFFFFFFFFL).toString(16)}")
             }
             return ints.joinToString(" ")
         }

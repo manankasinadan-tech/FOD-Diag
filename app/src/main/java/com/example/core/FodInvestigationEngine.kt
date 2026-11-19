@@ -170,65 +170,133 @@ class FodInvestigationEngine(
         emit(2, "Inspection en direct HAL & Services", "${activeHalLines.size} interfaces HAL/Binder/VINTF détectées.")
 
         // ── PHASE 3 : DÉCOUVERTE DYNAMIQUE SUR PARTITIONS SYSTÈME & VENDOR ────────────
-        emit(3, "Découverte dynamique des partitions", "Exploration de /vendor, /odm, /system, /system_ext, /product, /apex sans chemins figés...")
+        emit(3, "Découverte dynamique des partitions", "Exploration approfondie de /vendor, /odm, /system, /system_ext, /product, /apex & firmware...")
         val kwRegex = buildDynamicGrepRegex(dynamicKeywords)
 
         val discoverFilesCmd = """
             for part in /vendor /odm /system /system_ext /product /apex; do
               if [ -d "${'$'}part" ]; then
-                find "${'$'}part" -maxdepth 6 \( -type f -o -type l \) 2>/dev/null | grep -iE '$kwRegex' | head -n 90
+                find "${'$'}part" -maxdepth 7 \( -type f -o -type l \) 2>/dev/null | grep -iE '$kwRegex' | head -n 220
+              fi
+            done
+            for fw in /vendor/firmware /lib/firmware /vendor/firmware_mnt/image; do
+              if [ -d "${'$'}fw" ]; then
+                find "${'$'}fw" -maxdepth 3 2>/dev/null | grep -iE 'goodix|gf|fpc|silead|fp|fod|touch|fts|gt9|focal' | head -n 60
               fi
             done
         """.trimIndent()
-        val discoveredPaths = shell.exec(discoverFilesCmd, preferRoot = true, timeoutMs = 18_000L)
+        val discoveredPaths = shell.exec(discoverFilesCmd, preferRoot = true, timeoutMs = 22_000L)
             .stdout.lines().map { it.trim() }.filter { it.startsWith("/") }.distinct()
 
-        // Scripts init.*.rc, VINTF manifests, ld.config*.txt
+        // Scripts init.*.rc, VINTF manifests, ld.config*.txt, overlays & permissions XML
         val configSearchCmd = """
             for part in /vendor/etc /odm/etc /system/etc /system_ext/etc /product/etc; do
               if [ -d "${'$'}part" ]; then
-                grep -rliE 'fingerprint|udfps|fod|biometric|goodix|fpc|silead|hbm|lhbm' "${'$'}part/init" "${'$'}part/vintf" 2>/dev/null | head -n 40
+                grep -rliE 'fingerprint|udfps|fod|biometric|goodix|fpc|silead|hbm|lhbm|touchfeature|displayfeature' "${'$'}part/init" "${'$'}part/vintf" "${'$'}part/permissions" 2>/dev/null | head -n 80
               fi
             done
-            ls -1 /system/etc/ld.config*.txt /linkerconfig/ld.config.txt /vendor/etc/vintf/*.xml /system/etc/vintf/*.xml /system_ext/etc/vintf/*.xml /product/etc/vintf/*.xml 2>/dev/null
+            for ovl in /vendor/overlay /odm/overlay /product/overlay /system_ext/overlay /system/overlay; do
+              if [ -d "${'$'}ovl" ]; then
+                find "${'$'}ovl" -maxdepth 3 -name '*.apk' 2>/dev/null | head -n 60
+              fi
+            done
+            ls -1 /system/etc/ld.config*.txt /linkerconfig/ld.config.txt /vendor/etc/vintf/*.xml /vendor/etc/vintf/manifest/*.xml /system/etc/vintf/*.xml /system_ext/etc/vintf/*.xml /product/etc/vintf/*.xml 2>/dev/null
         """.trimIndent()
-        val configPaths = shell.exec(configSearchCmd, preferRoot = true, timeoutMs = 14_000L)
+        val configPaths = shell.exec(configSearchCmd, preferRoot = true, timeoutMs = 16_000L)
             .stdout.lines().map { it.trim() }.filter { it.startsWith("/") }.distinct()
 
-        // Index complet des bibliothèques .so disponibles sur le système pour vérifier DT_NEEDED
+        // Index complet des bibliothèques .so avec chemins réels (64-bit & 32-bit) pour résoudre DT_NEEDED
         val libIndexOut = shell.exec(
-            "find /vendor/lib64 /vendor/lib /system/lib64 /system/lib /system_ext/lib64 /odm/lib64 /apex -maxdepth 4 -name '*.so' 2>/dev/null | awk -F'/' '{print \$NF}' | sort -u",
+            "find /vendor/lib64 /vendor/lib /odm/lib64 /odm/lib /system_ext/lib64 /system_ext/lib /product/lib64 /system/lib64 /system/lib /apex -maxdepth 5 \\( -type f -o -type l \\) -name '*.so' 2>/dev/null",
             preferRoot = true,
-            timeoutMs = 12_000L
+            timeoutMs = 14_000L
         ).stdout
-        val availableSoNames = libIndexOut.lines().map { it.trim() }.filter { it.endsWith(".so") }.toSet()
+        val allSoPaths = libIndexOut.lines().map { it.trim() }.filter { it.startsWith("/") && it.endsWith(".so") }
+        val soMap64 = LinkedHashMap<String, String>()
+        val soMap32 = LinkedHashMap<String, String>()
+        val combinedSoMap = LinkedHashMap<String, String>()
+        for (soPath in allSoPaths) {
+            val baseName = soPath.substringAfterLast('/')
+            if (soPath.contains("lib64") || !soPath.contains("/lib/")) {
+                soMap64.putIfAbsent(baseName, soPath)
+            } else {
+                soMap32.putIfAbsent(baseName, soPath)
+            }
+            combinedSoMap.putIfAbsent(baseName, soPath)
+        }
+        // Compléter chaque map avec l'autre en fallback
+        combinedSoMap.forEach { (k, v) ->
+            soMap64.putIfAbsent(k, v)
+            soMap32.putIfAbsent(k, v)
+        }
 
-        val allCandidateFiles = (discoveredPaths + configPaths).distinct().take(160)
-        emit(3, "Découverte dynamique des partitions", "${allCandidateFiles.size} fichiers candidats & ${availableSoNames.size} bibliothèques .so indexées.")
+        val allCandidateFiles = (discoveredPaths + configPaths).distinct().take(380)
+        emit(3, "Découverte dynamique des partitions", "${allCandidateFiles.size} fichiers candidats & ${combinedSoMap.size} bibliothèques .so indexées (${allSoPaths.size} chemins).")
 
-        // ── PHASE 4 : ANALYSE BINAIRE ELF & RÉSOLUTION DES DÉPENDANCES ────────────────
-        emit(4, "Inspection ELF & dépendances DT_NEEDED", "Analyse des binaires HAL et bibliothèques partagées .so en lecture seule...")
-        val elfCandidates = allCandidateFiles.filter { path ->
+        // ── PHASE 4 : ANALYSE BINAIRE ELF & RÉSOLUTION RÉCURSIVE DT_NEEDED ───────────
+        emit(4, "Inspection ELF & dépendances récursives", "Extraction et reconstruction quasi-C++ des binaires HAL et dépendances DT_NEEDED...")
+        val seedElfCandidates = (allCandidateFiles.filter { path ->
             path.endsWith(".so") || path.contains("/bin/") || path.contains("/hw/")
-        }.take(if (deepBinaryInspection) 45 else 20)
+        } + allSoPaths.filter { p ->
+            val l = p.lowercase()
+            l.contains("fingerprint") || l.contains("udfps") || l.contains("fod") ||
+                l.contains("goodix") || l.contains("gf_") || l.contains("fpc") ||
+                l.contains("silead") || l.contains("egistec") || l.contains("biometric") ||
+                l.contains("displayfeature") || l.contains("touchfeature")
+        }).distinct()
 
-        for (path in elfCandidates) {
+        val elfQueue = ArrayDeque<Pair<String, Int>>()
+        val queuedOrVisitedElf = HashSet<String>()
+        seedElfCandidates.forEach { p ->
+            if (queuedOrVisitedElf.add(p)) elfQueue.add(p to 0)
+        }
+
+        val maxElfAnalyze = if (deepBinaryInspection) 140 else 45
+        var analyzedElfCount = 0
+
+        while (elfQueue.isNotEmpty() && analyzedElfCount < maxElfAnalyze) {
+            val (path, depth) = elfQueue.removeFirst()
             if (BiometricPrivacyGuard.isProtectedBiometricPath(path)) {
                 exclusions.add(BiometricPrivacyGuard.explainExclusion(path))
                 continue
             }
+
             val statLine = shell.exec("ls -ldZ ${RootShellExecutor.shellQuote(path)} 2>/dev/null", preferRoot = true).stdout.trim()
+            if (statLine.isBlank()) continue
             val (perms, selinuxCtx) = DeviceTreeAndSysfsProbe.parseLsZ(statLine)
             val sha = shell.computeSha256Safe(path, preferRoot = true)
-            val bytes = shell.readFileBytesSafe(path, maxBytes = 8 * 1024 * 1024, preferRoot = true)
-            val elfInfo = if (bytes != null) ElfAnalyzer.analyze(bytes, availableSoNames, dynamicKeywords) else null
+            val bytes = shell.readFileBytesSafe(path, maxBytes = 14 * 1024 * 1024, preferRoot = true) ?: continue
+            analyzedElfCount++
+
+            val targetSoMap = if (path.contains("/lib/") && !path.contains("lib64")) soMap32 else soMap64
+            val elfInfo = ElfAnalyzer.analyze(
+                bytes = bytes,
+                availableLibraries = targetSoMap,
+                dynamicKeywords = dynamicKeywords,
+                sourcePath = path
+            )
 
             val layer = classifyLayer(path)
             val isOem = isOemSpecificPath(path)
             val summary = if (elfInfo != null) {
-                "${elfInfo.machine} • ${elfInfo.neededLibraries.size} DT_NEEDED (${elfInfo.missingLibraries.size} manquantes) • ${elfInfo.fodSymbols.size} symboles FOD"
+                buildString {
+                    append("${elfInfo.machine} • ${elfInfo.neededLibraries.size} DT_NEEDED")
+                    if (depth > 0) append(" (dép. niv.$depth)")
+                    append(" (${elfInfo.missingLibraries.size} manquantes) • ${elfInfo.exportedSymbols.size} exports / ${elfInfo.fodSymbols.size} FOD")
+                }
             } else {
-                "Exécutable / Bibliothèque système (${bytes?.size ?: 0} octets)"
+                "Exécutable / Bibliothèque système (${bytes.size} octets)"
+            }
+
+            val pseudoCppPath = if (elfInfo != null && elfInfo.pseudoSourceCode.isNotBlank()) {
+                "quasi_code_source/elf/${sanitizeArtifactFileName(path)}.cpp"
+            } else {
+                null
+            }
+            val extractedRel = if (!isGenericSystemBaseLib(path.substringAfterLast('/'))) {
+                "fichiers_extraits/${path.removePrefix("/")}"
+            } else {
+                null
             }
 
             artifacts.add(
@@ -236,34 +304,52 @@ class FodInvestigationEngine(
                     id = "art_${artifacts.size}_${path.hashCode()}",
                     path = path,
                     layer = layer,
-                    kind = if (path.endsWith(".so")) "Bibliothèque ELF (.so)" else "Binaire / Service HAL",
+                    kind = when {
+                        depth > 0 && path.endsWith(".so") -> "Dépendance ELF niv.$depth (.so)"
+                        path.endsWith(".so") -> "Bibliothèque ELF (.so)"
+                        else -> "Binaire / Service HAL"
+                    },
                     sha256 = sha,
-                    sizeBytes = bytes?.size?.toLong() ?: 0L,
+                    sizeBytes = bytes.size.toLong(),
                     permissions = perms,
                     seLinuxContext = selinuxCtx,
                     summary = summary,
                     isOemPatch = isOem,
-                    elfAnalysis = elfInfo
+                    elfAnalysis = elfInfo,
+                    extractedRelativePath = extractedRel,
+                    pseudoSourcePath = pseudoCppPath
                 )
             )
 
-            if (elfInfo != null && elfInfo.missingLibraries.isNotEmpty()) {
-                anomalies.add(
-                    FodAnomaly(
-                        id = "anom_elf_${anomalies.size}",
-                        title = "Dépendance ELF introuvable dans ${path.substringAfterLast('/')}",
-                        severity = SeverityLevel.CRITIQUE,
-                        layer = layer,
-                        evidence = "Bibliothèques DT_NEEDED absentes : ${elfInfo.missingLibraries.joinToString(", ")} (dans $path)",
-                        impact = "Le service ou HAL biométrique ne peut pas être chargé par le linker dynamique sur ce système/GSI.",
-                        portingAction = "Vérifier /vendor/etc/ld.config.txt (namespace VNDK/vendor) ou porter les .so manquants : ${elfInfo.missingLibraries.joinToString(", ")}."
+            if (elfInfo != null) {
+                if (elfInfo.missingLibraries.isNotEmpty()) {
+                    anomalies.add(
+                        FodAnomaly(
+                            id = "anom_elf_${anomalies.size}",
+                            title = "Dépendance ELF introuvable dans ${path.substringAfterLast('/')}",
+                            severity = SeverityLevel.CRITIQUE,
+                            layer = layer,
+                            evidence = "Bibliothèques DT_NEEDED absentes : ${elfInfo.missingLibraries.joinToString(", ")} (dans $path)",
+                            impact = "Le service ou HAL biométrique ne peut pas être chargé par le linker dynamique sur ce système/GSI.",
+                            portingAction = "Vérifier /vendor/etc/ld.config.txt (namespace VNDK/vendor) ou porter les .so manquants : ${elfInfo.missingLibraries.joinToString(", ")}."
+                        )
                     )
-                )
+                }
+
+                // Traversée récursive des dépendances DT_NEEDED (jusqu'à profondeur 4)
+                if (depth < 4) {
+                    elfInfo.resolvedDependencies.forEach { (depName, depPath) ->
+                        if (!isGenericSystemBaseLib(depName) && queuedOrVisitedElf.add(depPath)) {
+                            elfQueue.add(depPath to (depth + 1))
+                        }
+                    }
+                }
             }
         }
+        emit(4, "Inspection ELF & dépendances récursives", "$analyzedElfCount binaires & dépendances ELF inspectés en profondeur.")
 
         // ── PHASE 5 : INSPECTION À FROID DEX / APK / JAR / RRO & CONFIGS ─────────────
-        emit(5, "Inspection DEX, RRO & configurations", "Extraction en lecture seule des classes UDFPS/FOD et surcharges RRO (aucune modification d'APK)...")
+        emit(5, "Inspection DEX, RRO & configurations", "Décodage AXML, Dalvik DEX, init.rc et manifestes (aucune modification d'APK)...")
         val apkJarCandidates = (allCandidateFiles.filter {
             it.endsWith(".apk") || it.endsWith(".jar")
         } + listOf(
@@ -273,7 +359,7 @@ class FodInvestigationEngine(
             "/system/framework/framework.jar",
             "/system/framework/services.jar",
             "/system/framework/framework-res.apk"
-        )).distinct().take(if (deepBinaryInspection) 24 else 10)
+        )).distinct().take(if (deepBinaryInspection) 40 else 14)
 
         for (path in apkJarCandidates) {
             val existsRes = shell.exec("[ -f ${RootShellExecutor.shellQuote(path)} ] && ls -ldZ ${RootShellExecutor.shellQuote(path)} 2>/dev/null", preferRoot = true)
@@ -289,7 +375,17 @@ class FodInvestigationEngine(
                     if (dexRro.rroTargetPackage != null) {
                         append("RRO → ${dexRro.rroTargetPackage} (priorité ${dexRro.rroPriority ?: "?"}) • ")
                     }
-                    append("${dexRro.matchedClasses.size} classes • ${dexRro.matchedConfigKeys.size} clés config")
+                    append("${dexRro.matchedClasses.size} classes • ${dexRro.matchedMethods.size} méthodes • ${dexRro.matchedConfigKeys.size} clés config")
+                }
+                val pseudoPath = when {
+                    dexRro.pseudoSourceCode.isNotBlank() -> "quasi_code_source/dex_java/${sanitizeArtifactFileName(path)}.java"
+                    dexRro.decodedRroXml.isNotBlank() -> "quasi_code_source/rro_xml/${sanitizeArtifactFileName(path)}.xml"
+                    else -> null
+                }
+                val extractRel = if (isRro || path.contains("SystemUI", true) || path.contains("fingerprint", true) || path.contains("biometric", true)) {
+                    "fichiers_extraits/${path.removePrefix("/")}"
+                } else {
+                    null
                 }
                 artifacts.add(
                     DiscoveredArtifact(
@@ -303,7 +399,9 @@ class FodInvestigationEngine(
                         seLinuxContext = selinuxCtx,
                         summary = summary,
                         isOemPatch = isOemSpecificPath(path) || isRro,
-                        dexRroAnalysis = dexRro
+                        dexRroAnalysis = dexRro,
+                        extractedRelativePath = extractRel,
+                        pseudoSourcePath = pseudoPath
                     )
                 )
             }
@@ -312,7 +410,7 @@ class FodInvestigationEngine(
         // Fichiers texte init.rc, vintf, linker, permissions
         val textConfigFiles = allCandidateFiles.filter {
             it.endsWith(".rc") || it.endsWith(".xml") || it.endsWith(".txt") || it.endsWith(".conf") || it.endsWith(".prop")
-        }.take(55)
+        }.take(100)
 
         for (path in textConfigFiles) {
             if (BiometricPrivacyGuard.isProtectedBiometricPath(path)) {
@@ -322,18 +420,31 @@ class FodInvestigationEngine(
             val statLine = shell.exec("ls -ldZ ${RootShellExecutor.shellQuote(path)} 2>/dev/null", preferRoot = true).stdout.trim()
             val (perms, selinuxCtx) = DeviceTreeAndSysfsProbe.parseLsZ(statLine)
             val sha = shell.computeSha256Safe(path, preferRoot = true)
-            val rawBytes = shell.readFileBytesSafe(path, maxBytes = 512 * 1024, preferRoot = true)
+            val rawBytes = shell.readFileBytesSafe(path, maxBytes = 768 * 1024, preferRoot = true)
             val content = rawBytes?.toString(Charsets.UTF_8).orEmpty()
-            val matchedLines = content.lines()
-                .filter { line ->
-                    val l = line.lowercase()
-                    l.contains("finger") || l.contains("udfps") || l.contains("fod") ||
-                        l.contains("biometric") || l.contains("hbm") || l.contains("lhbm") ||
-                        l.contains("goodix") || l.contains("fpc") || l.contains("silead") ||
-                        l.contains("touch") || l.contains("display")
+
+            val excerptText = if (path.endsWith(".rc")) {
+                extractRelevantInitRcBlocks(content)
+            } else {
+                content.lines()
+                    .filter { line ->
+                        val l = line.lowercase()
+                        l.contains("finger") || l.contains("udfps") || l.contains("fod") ||
+                            l.contains("biometric") || l.contains("hbm") || l.contains("lhbm") ||
+                            l.contains("goodix") || l.contains("fpc") || l.contains("silead") ||
+                            l.contains("touch") || l.contains("display")
+                    }
+                    .take(80)
+                    .joinToString("\n")
+            }
+
+            if (excerptText.isNotBlank() || path.contains("vintf") || path.contains("ld.config")) {
+                val finalExcerpt = excerptText.ifBlank { content.take(4000) }
+                val pseudoCfgPath = when {
+                    path.endsWith(".rc") -> "quasi_code_source/init/${sanitizeArtifactFileName(path)}"
+                    path.endsWith(".xml") -> "quasi_code_source/xml/${sanitizeArtifactFileName(path)}"
+                    else -> "quasi_code_source/configs/${sanitizeArtifactFileName(path)}"
                 }
-                .take(40)
-            if (matchedLines.isNotEmpty() || path.contains("vintf") || path.contains("ld.config")) {
                 artifacts.add(
                     DiscoveredArtifact(
                         id = "art_${artifacts.size}_${path.hashCode()}",
@@ -349,9 +460,11 @@ class FodInvestigationEngine(
                         sizeBytes = rawBytes?.size?.toLong() ?: 0L,
                         permissions = perms,
                         seLinuxContext = selinuxCtx,
-                        summary = "${matchedLines.size} directives FOD/HAL pertinentes extraites",
+                        summary = "${finalExcerpt.lines().size} lignes FOD/HAL pertinentes extraites",
                         isOemPatch = isOemSpecificPath(path),
-                        rawExcerpt = matchedLines.joinToString("\n")
+                        rawExcerpt = finalExcerpt,
+                        extractedRelativePath = "fichiers_extraits/${path.removePrefix("/")}",
+                        pseudoSourcePath = pseudoCfgPath
                     )
                 )
             }
@@ -374,7 +487,8 @@ class FodInvestigationEngine(
                     summary = "compatible=${dt.compatible ?: "non défini"} (${dt.properties.size} propriétés)",
                     isOemPatch = true,
                     deviceTreeNode = dt,
-                    rawExcerpt = dt.properties.entries.joinToString("\n") { "${it.key} = ${it.value}" }
+                    rawExcerpt = dt.properties.entries.joinToString("\n") { "${it.key} = ${it.value}" },
+                    pseudoSourcePath = if (dt.pseudoDtsi.isNotBlank()) "quasi_code_source/devicetree/${sanitizeArtifactFileName(dt.nodePath)}.dtsi" else null
                 )
             )
         }
@@ -433,11 +547,16 @@ class FodInvestigationEngine(
             .distinct()
             .take(80)
 
+        val teRules = LinkedHashSet<String>()
         for (line in seLogs) {
             val domain = Regex("scontext=u:r:([^:]+):").find(line)?.groupValues?.getOrNull(1)
             val target = Regex("tcontext=u:[^:]+:([^:]+):").find(line)?.groupValues?.getOrNull(1)
             val tclass = Regex("tclass=([^\\s]+)").find(line)?.groupValues?.getOrNull(1)
             val perm = Regex("\\{\\s*([^}]+)\\s*\\}").find(line)?.groupValues?.getOrNull(1)?.trim()
+
+            if (!domain.isNullOrBlank() && !target.isNullOrBlank() && !tclass.isNullOrBlank() && !perm.isNullOrBlank()) {
+                teRules.add("allow $domain $target:$tclass { $perm };")
+            }
 
             selinuxFindings.add(
                 SelinuxFinding(
@@ -451,6 +570,10 @@ class FodInvestigationEngine(
             )
         }
 
+        if (teRules.isNotEmpty()) {
+            liveDumps["sepolicy_fod_rules_te"] = "# Règles SELinux synthétisées depuis avc: denied\n" + teRules.joinToString("\n")
+        }
+
         if (seLogs.isNotEmpty()) {
             anomalies.add(
                 FodAnomaly(
@@ -460,7 +583,7 @@ class FodInvestigationEngine(
                     layer = SystemLayer.SELINUX,
                     evidence = seLogs.take(4).joinToString("\n"),
                     impact = "En mode $seLinuxMode, ces refus bloquent l'accès du HAL biométrique ou de SystemUI aux nœuds sysfs/ioctl/services vendor.",
-                    portingAction = "Ajouter les règles allow correspondantes (allow <scontext> <tcontext>:<tclass> { <perm> };) dans la politique SELinux du GSI ou du vendor overlay."
+                    portingAction = "Ajouter les règles générées dans quasi_code_source/fod_sepolicy.te :\n${teRules.take(6).joinToString("\n")}"
                 )
             )
         }
@@ -882,17 +1005,28 @@ class FodInvestigationEngine(
             sb.appendLine("### `${art.path}`")
             sb.appendLine("- **Couche** : ${art.layer.labelFr} | **Type** : ${art.kind} ${if (art.isOemPatch) "| **Patch constructeur détecté**" else ""}")
             sb.appendLine("- **SHA-256** : `${art.sha256}` | **Permissions** : `${art.permissions}` | **SELinux** : `${art.seLinuxContext}`")
+            art.extractedRelativePath?.let { sb.appendLine("- **Fichier extrait** : `$it`") }
+            art.pseudoSourcePath?.let { sb.appendLine("- **Quasi-code source généré** : `$it`") }
             sb.appendLine("- **Résumé** : ${art.summary}")
             art.elfAnalysis?.let { elf ->
                 sb.appendLine("- **ELF DT_NEEDED (${elf.neededLibraries.size})** : `${elf.neededLibraries.joinToString(", ")}`")
+                if (elf.resolvedDependencies.isNotEmpty()) {
+                    sb.appendLine("- **Dépendances résolues** : ${elf.resolvedDependencies.entries.take(20).joinToString(" | ") { "${it.key} -> `${it.value}`" }}")
+                }
                 if (elf.missingLibraries.isNotEmpty()) {
                     sb.appendLine("- **ELF MANQUANTES** : `${elf.missingLibraries.joinToString(", ")}`")
                 }
-                if (elf.fodSymbols.isNotEmpty()) {
-                    sb.appendLine("- **Symboles FOD** : `${elf.fodSymbols.take(25).joinToString(", ")}`")
+                if (elf.exportedSymbols.isNotEmpty()) {
+                    sb.appendLine("- **Symboles exportés (.dynsym)** : `${elf.exportedSymbols.take(20).joinToString(", ")}`")
+                }
+                if (elf.importedSymbols.isNotEmpty()) {
+                    sb.appendLine("- **Symboles importés (UND)** : `${elf.importedSymbols.take(20).joinToString(", ")}`")
                 }
                 if (elf.fodStrings.isNotEmpty()) {
-                    sb.appendLine("- **Chaînes FOD** : `${elf.fodStrings.take(20).joinToString(" | ")}`")
+                    sb.appendLine("- **Chaînes FOD (.rodata)** : `${elf.fodStrings.take(20).joinToString(" | ")}`")
+                }
+                if (elf.pseudoSourceCode.isNotBlank()) {
+                    sb.appendLine("```cpp\n${elf.pseudoSourceCode.take(2200)}\n```")
                 }
             }
             art.dexRroAnalysis?.let { dr ->
@@ -907,9 +1041,20 @@ class FodInvestigationEngine(
                 if (dr.matchedConfigKeys.isNotEmpty()) {
                     sb.appendLine("- **Clés de ressources/config** : `${dr.matchedConfigKeys.take(30).joinToString(", ")}`")
                 }
+                if (dr.decodedRroXml.isNotBlank()) {
+                    sb.appendLine("```xml\n${dr.decodedRroXml.take(1600)}\n```")
+                }
+                if (dr.pseudoSourceCode.isNotBlank()) {
+                    sb.appendLine("```java\n${dr.pseudoSourceCode.take(2000)}\n```")
+                }
+            }
+            art.deviceTreeNode?.let { dt ->
+                if (dt.pseudoDtsi.isNotBlank()) {
+                    sb.appendLine("```dts\n${dt.pseudoDtsi.take(1500)}\n```")
+                }
             }
             if (art.rawExcerpt.isNotBlank()) {
-                sb.appendLine("```text\n${art.rawExcerpt.take(1200)}\n```")
+                sb.appendLine("```text\n${art.rawExcerpt.take(1500)}\n```")
             }
             sb.appendLine()
         }
@@ -1041,6 +1186,71 @@ class FodInvestigationEngine(
         if (text.isNotBlank()) {
             liveDumps["sdk_live_telemetry"] = text
         }
+    }
+
+    private fun isGenericSystemBaseLib(libName: String): Boolean {
+        val base = libName.substringAfterLast('/').lowercase()
+        val generic = setOf(
+            "libc.so", "libm.so", "libdl.so", "libstdc++.so", "libc++.so", "libc++_shared.so",
+            "liblog.so", "libz.so", "libandroid.so", "libvndksupport.so", "libdl_android.so",
+            "ld-android.so", "libclang_rt.ubsan_standalone-aarch64-android.so"
+        )
+        return base in generic
+    }
+
+    private fun sanitizeArtifactFileName(path: String): String {
+        return path.removePrefix("/")
+            .replace('/', '_')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(110)
+    }
+
+    private fun extractRelevantInitRcBlocks(content: String): String {
+        val lines = content.lines()
+        val out = StringBuilder()
+        var capturingBlock = false
+        var blockBuffer = mutableListOf<String>()
+
+        fun flushIfRelevant() {
+            if (blockBuffer.isNotEmpty()) {
+                val joined = blockBuffer.joinToString("\n")
+                val lower = joined.lowercase()
+                if (lower.contains("finger") || lower.contains("udfps") || lower.contains("fod") ||
+                    lower.contains("biometric") || lower.contains("goodix") || lower.contains("fpc") ||
+                    lower.contains("silead") || lower.contains("hbm") || lower.contains("lhbm") ||
+                    lower.contains("touch") || lower.contains("disp_param")
+                ) {
+                    out.appendLine(joined)
+                    out.appendLine()
+                }
+            }
+            blockBuffer = mutableListOf()
+        }
+
+        for (line in lines) {
+            val trimmed = line.trimStart()
+            val isTopLevel = trimmed.isNotEmpty() && !line.startsWith(" ") && !line.startsWith("\t") && !trimmed.startsWith("#")
+            if (isTopLevel && (trimmed.startsWith("service ") || trimmed.startsWith("on ") || trimmed.startsWith("import "))) {
+                flushIfRelevant()
+                capturingBlock = true
+                blockBuffer.add(line)
+            } else if (capturingBlock) {
+                if (trimmed.isEmpty()) {
+                    flushIfRelevant()
+                    capturingBlock = false
+                } else {
+                    blockBuffer.add(line)
+                }
+            } else {
+                val lower = trimmed.lowercase()
+                if (lower.contains("finger") || lower.contains("fod") || lower.contains("udfps") || lower.contains("goodix") || lower.contains("hbm")) {
+                    out.appendLine(line)
+                }
+            }
+            if (out.length > 14_000) break
+        }
+        flushIfRelevant()
+        return out.toString().trim()
     }
 
     private fun sha256Text(text: String): String {

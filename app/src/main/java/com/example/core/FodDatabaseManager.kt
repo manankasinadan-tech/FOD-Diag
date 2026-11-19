@@ -30,7 +30,10 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-class FodDatabaseManager(private val context: Context) {
+class FodDatabaseManager(
+    private val context: Context,
+    private val shell: RootShellExecutor = RootShellExecutor()
+) {
 
     fun getPreferredDatabaseDir(): File {
         val sdcardDir = File("/sdcard/FOD Database")
@@ -162,10 +165,87 @@ class FodDatabaseManager(private val context: Context) {
             File(rawDir, "$safeName.txt").writeText(content)
         }
 
-        // 6. RAPPORT_COMPLET_FOD.md
+        // 6. fichiers_extraits/ (extraction réelle des libs .so, dépendances, configs, RRO)
+        val extractedRoot = File(snapDir, "fichiers_extraits").apply { mkdirs() }
+        var extractedTotalBytes = 0L
+        val maxTotalExtractBytes = 220L * 1024L * 1024L
+        for (art in updatedSnapshot.artifacts) {
+            val rel = art.extractedRelativePath ?: continue
+            if (BiometricPrivacyGuard.isProtectedBiometricPath(art.path)) continue
+            if (extractedTotalBytes >= maxTotalExtractBytes) break
+            val cleanRel = rel.removePrefix("fichiers_extraits/").trimStart('/')
+            if (cleanRel.isBlank() || cleanRel.contains("..")) continue
+            val destFile = File(extractedRoot, cleanRel)
+            val ok = shell.copyFileToDestinationSafe(art.path, destFile, maxBytes = 24L * 1024L * 1024L)
+            if (ok && destFile.exists()) {
+                extractedTotalBytes += destFile.length()
+            }
+        }
+
+        // 7. quasi_code_source/ (C/C++, Java DEX, XML RRO, DTSI, init.rc, SELinux .te)
+        val initRcAggregate = StringBuilder()
+        for (art in updatedSnapshot.artifacts) {
+            art.elfAnalysis?.pseudoSourceCode?.takeIf { it.isNotBlank() }?.let { cpp ->
+                val rel = art.pseudoSourcePath ?: "quasi_code_source/elf/${art.id}.cpp"
+                writeSafeRelativeText(snapDir, rel, cpp)
+            }
+            art.dexRroAnalysis?.let { dr ->
+                if (dr.pseudoSourceCode.isNotBlank()) {
+                    val javaRel = if (art.pseudoSourcePath?.endsWith(".java") == true) {
+                        art.pseudoSourcePath
+                    } else {
+                        "quasi_code_source/dex_java/${sanitizeFileSegment(art.path)}.java"
+                    }
+                    writeSafeRelativeText(snapDir, javaRel, dr.pseudoSourceCode)
+                }
+                if (dr.decodedRroXml.isNotBlank()) {
+                    val xmlRel = "quasi_code_source/rro_xml/${sanitizeFileSegment(art.path)}.xml"
+                    writeSafeRelativeText(snapDir, xmlRel, dr.decodedRroXml)
+                }
+            }
+            art.deviceTreeNode?.pseudoDtsi?.takeIf { it.isNotBlank() }?.let { dtsi ->
+                val rel = art.pseudoSourcePath ?: "quasi_code_source/devicetree/${sanitizeFileSegment(art.path)}.dtsi"
+                writeSafeRelativeText(snapDir, rel, dtsi)
+            }
+            if (art.elfAnalysis == null && art.dexRroAnalysis == null && art.deviceTreeNode == null && art.rawExcerpt.isNotBlank()) {
+                art.pseudoSourcePath?.let { rel ->
+                    writeSafeRelativeText(snapDir, rel, "# Source: ${art.path}\n${art.rawExcerpt}")
+                }
+                if (art.path.endsWith(".rc")) {
+                    initRcAggregate.appendLine("# === ${art.path} ===")
+                    initRcAggregate.appendLine(art.rawExcerpt)
+                    initRcAggregate.appendLine()
+                }
+            }
+        }
+        if (initRcAggregate.isNotBlank()) {
+            writeSafeRelativeText(snapDir, "quasi_code_source/init_fod_services.rc", initRcAggregate.toString())
+        }
+        updatedSnapshot.liveDumps["sepolicy_fod_rules_te"]?.takeIf { it.isNotBlank() }?.let { te ->
+            writeSafeRelativeText(snapDir, "quasi_code_source/fod_sepolicy.te", te)
+        }
+
+        // 8. RAPPORT_COMPLET_FOD.md
         File(snapDir, "RAPPORT_COMPLET_FOD.md").writeText(updatedSnapshot.reportMarkdown)
 
         updatedSnapshot
+    }
+
+    private fun writeSafeRelativeText(snapDir: File, relativePath: String, content: String) {
+        val clean = relativePath.trimStart('/')
+        if (clean.contains("..")) return
+        runCatching {
+            val target = File(snapDir, clean)
+            target.parentFile?.mkdirs()
+            target.writeText(content)
+        }
+    }
+
+    private fun sanitizeFileSegment(path: String): String {
+        return path.removePrefix("/")
+            .replace('/', '_')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(110)
     }
 
     suspend fun listAllSnapshots(): List<FodSnapshot> = withContext(Dispatchers.IO) {
@@ -511,8 +591,12 @@ class FodDatabaseManager(private val context: Context) {
             .put("summary", a.summary)
             .put("isOemPatch", a.isOemPatch)
             .put("rawExcerpt", a.rawExcerpt)
+            .put("extractedRelativePath", a.extractedRelativePath)
+            .put("pseudoSourcePath", a.pseudoSourcePath)
 
         a.elfAnalysis?.let { elf ->
+            val resolvedObj = JSONObject()
+            elf.resolvedDependencies.forEach { (k, v) -> resolvedObj.put(k, v) }
             obj.put(
                 "elfAnalysis",
                 JSONObject()
@@ -520,9 +604,13 @@ class FodDatabaseManager(private val context: Context) {
                     .put("is64Bit", elf.is64Bit)
                     .put("soName", elf.soName)
                     .put("neededLibraries", JSONArray(elf.neededLibraries))
+                    .put("resolvedDependencies", resolvedObj)
                     .put("missingLibraries", JSONArray(elf.missingLibraries))
                     .put("fodSymbols", JSONArray(elf.fodSymbols))
+                    .put("exportedSymbols", JSONArray(elf.exportedSymbols))
+                    .put("importedSymbols", JSONArray(elf.importedSymbols))
                     .put("fodStrings", JSONArray(elf.fodStrings))
+                    .put("pseudoSourceCode", elf.pseudoSourceCode.take(32_000))
             )
         }
 
@@ -540,6 +628,8 @@ class FodDatabaseManager(private val context: Context) {
                     .put("matchedMethods", JSONArray(dr.matchedMethods))
                     .put("matchedConfigKeys", JSONArray(dr.matchedConfigKeys))
                     .put("udfpsProperties", propsObj)
+                    .put("decodedRroXml", dr.decodedRroXml.take(16_000))
+                    .put("pseudoSourceCode", dr.pseudoSourceCode.take(32_000))
             )
         }
 
@@ -552,6 +642,7 @@ class FodDatabaseManager(private val context: Context) {
                     .put("nodePath", dt.nodePath)
                     .put("compatible", dt.compatible)
                     .put("properties", pObj)
+                    .put("pseudoDtsi", dt.pseudoDtsi.take(12_000))
             )
         }
 
@@ -561,14 +652,21 @@ class FodDatabaseManager(private val context: Context) {
     private fun deserializeArtifact(o: JSONObject): DiscoveredArtifact {
         val elfObj = o.optJSONObject("elfAnalysis")
         val elf = elfObj?.let {
+            val resObj = it.optJSONObject("resolvedDependencies")
+            val resMap = LinkedHashMap<String, String>()
+            resObj?.keys()?.forEach { k -> resMap[k] = resObj.optString(k) }
             ElfAnalysis(
                 machine = it.optString("machine"),
                 is64Bit = it.optBoolean("is64Bit", true),
                 soName = it.optString("soName").takeIf { s -> s.isNotBlank() && s != "null" },
                 neededLibraries = jsonArrayToList(it.optJSONArray("neededLibraries")),
+                resolvedDependencies = resMap,
                 missingLibraries = jsonArrayToList(it.optJSONArray("missingLibraries")),
                 fodSymbols = jsonArrayToList(it.optJSONArray("fodSymbols")),
-                fodStrings = jsonArrayToList(it.optJSONArray("fodStrings"))
+                exportedSymbols = jsonArrayToList(it.optJSONArray("exportedSymbols")),
+                importedSymbols = jsonArrayToList(it.optJSONArray("importedSymbols")),
+                fodStrings = jsonArrayToList(it.optJSONArray("fodStrings")),
+                pseudoSourceCode = it.optString("pseudoSourceCode")
             )
         }
 
@@ -585,7 +683,9 @@ class FodDatabaseManager(private val context: Context) {
                 matchedClasses = jsonArrayToList(it.optJSONArray("matchedClasses")),
                 matchedMethods = jsonArrayToList(it.optJSONArray("matchedMethods")),
                 matchedConfigKeys = jsonArrayToList(it.optJSONArray("matchedConfigKeys")),
-                udfpsProperties = pMap
+                udfpsProperties = pMap,
+                decodedRroXml = it.optString("decodedRroXml"),
+                pseudoSourceCode = it.optString("pseudoSourceCode")
             )
         }
 
@@ -597,7 +697,8 @@ class FodDatabaseManager(private val context: Context) {
             DeviceTreeNode(
                 nodePath = it.optString("nodePath"),
                 compatible = it.optString("compatible").takeIf { s -> s.isNotBlank() && s != "null" },
-                properties = pMap
+                properties = pMap,
+                pseudoDtsi = it.optString("pseudoDtsi")
             )
         }
 
@@ -615,7 +716,9 @@ class FodDatabaseManager(private val context: Context) {
             elfAnalysis = elf,
             dexRroAnalysis = dr,
             deviceTreeNode = dt,
-            rawExcerpt = o.optString("rawExcerpt")
+            rawExcerpt = o.optString("rawExcerpt"),
+            extractedRelativePath = o.optString("extractedRelativePath").takeIf { s -> s.isNotBlank() && s != "null" },
+            pseudoSourcePath = o.optString("pseudoSourcePath").takeIf { s -> s.isNotBlank() && s != "null" }
         )
     }
 

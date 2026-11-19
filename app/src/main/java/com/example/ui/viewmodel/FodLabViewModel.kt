@@ -63,7 +63,7 @@ class FodLabViewModel(application: Application) : AndroidViewModel(application) 
 
     private val shell = RootShellExecutor()
     private val engine = FodInvestigationEngine(shell, application)
-    private val dbManager = FodDatabaseManager(application)
+    private val dbManager = FodDatabaseManager(application, shell)
     private val prefs = SettingsPreferences(application)
 
     private val _uiState = MutableStateFlow(FodLabUiState())

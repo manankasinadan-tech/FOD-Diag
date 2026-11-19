@@ -40,9 +40,13 @@ data class ElfAnalysis(
     val is64Bit: Boolean,
     val soName: String?,
     val neededLibraries: List<String>,
+    val resolvedDependencies: Map<String, String> = emptyMap(),
     val missingLibraries: List<String>,
     val fodSymbols: List<String>,
-    val fodStrings: List<String>
+    val exportedSymbols: List<String> = emptyList(),
+    val importedSymbols: List<String> = emptyList(),
+    val fodStrings: List<String>,
+    val pseudoSourceCode: String = ""
 )
 
 @Immutable
@@ -54,14 +58,17 @@ data class DexRroAnalysis(
     val matchedClasses: List<String>,
     val matchedMethods: List<String>,
     val matchedConfigKeys: List<String>,
-    val udfpsProperties: Map<String, String>
+    val udfpsProperties: Map<String, String>,
+    val decodedRroXml: String = "",
+    val pseudoSourceCode: String = ""
 )
 
 @Immutable
 data class DeviceTreeNode(
     val nodePath: String,
     val compatible: String?,
-    val properties: Map<String, String>
+    val properties: Map<String, String>,
+    val pseudoDtsi: String = ""
 )
 
 @Immutable
@@ -89,7 +96,9 @@ data class DiscoveredArtifact(
     val elfAnalysis: ElfAnalysis? = null,
     val dexRroAnalysis: DexRroAnalysis? = null,
     val deviceTreeNode: DeviceTreeNode? = null,
-    val rawExcerpt: String = ""
+    val rawExcerpt: String = "",
+    val extractedRelativePath: String? = null,
+    val pseudoSourcePath: String? = null
 )
 
 @Immutable

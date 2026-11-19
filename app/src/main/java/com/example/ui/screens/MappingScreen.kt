@@ -92,7 +92,12 @@ fun MappingScreen(
                 art.path.lowercase().contains(q) ||
                 art.kind.lowercase().contains(q) ||
                 art.summary.lowercase().contains(q) ||
-                art.sha256.lowercase().contains(q)
+                art.sha256.lowercase().contains(q) ||
+                (art.elfAnalysis?.neededLibraries?.any { it.lowercase().contains(q) } == true) ||
+                (art.elfAnalysis?.fodSymbols?.any { it.lowercase().contains(q) } == true) ||
+                (art.elfAnalysis?.pseudoSourceCode?.lowercase()?.contains(q) == true) ||
+                (art.dexRroAnalysis?.matchedClasses?.any { it.lowercase().contains(q) } == true) ||
+                (art.dexRroAnalysis?.pseudoSourceCode?.lowercase()?.contains(q) == true)
             matchLayer && matchQuery
         }
     }
@@ -290,9 +295,25 @@ private fun ArtifactDetailCard(
                 if (hasMissingElf) {
                     StatusPillBadge(label = "DT_NEEDED manquante", color = CrimsonCritical)
                 }
+                if (artifact.extractedRelativePath != null) {
+                    StatusPillBadge(label = "Extrait", color = EmeraldVerified)
+                }
+                if (artifact.pseudoSourcePath != null) {
+                    StatusPillBadge(label = "Quasi-source", color = CyanBiometric)
+                }
             }
 
             AnimatedVisibility(visible = expanded) {
+                var showPseudoCode by rememberSaveable(artifact.id) { mutableStateOf(true) }
+                val pseudoText = remember(artifact) {
+                    buildString {
+                        artifact.elfAnalysis?.pseudoSourceCode?.takeIf { it.isNotBlank() }?.let { appendLine(it) }
+                        artifact.dexRroAnalysis?.decodedRroXml?.takeIf { it.isNotBlank() }?.let { appendLine(it) }
+                        artifact.dexRroAnalysis?.pseudoSourceCode?.takeIf { it.isNotBlank() }?.let { appendLine(it) }
+                        artifact.deviceTreeNode?.pseudoDtsi?.takeIf { it.isNotBlank() }?.let { appendLine(it) }
+                    }.trim()
+                }
+
                 Surface(
                     shape = MaterialTheme.shapes.small,
                     color = MaterialTheme.colorScheme.background
@@ -305,17 +326,33 @@ private fun ArtifactDetailCard(
                     ) {
                         Text("SHA-256 : ${artifact.sha256}", style = MaterialTheme.typography.labelSmall)
                         Text("Permissions : ${artifact.permissions} | SELinux : ${artifact.seLinuxContext}", style = MaterialTheme.typography.labelSmall)
+                        artifact.extractedRelativePath?.let {
+                            Text("Fichier extrait : $it", style = MaterialTheme.typography.labelSmall, color = EmeraldVerified)
+                        }
+                        artifact.pseudoSourcePath?.let {
+                            Text("Quasi-code source : $it", style = MaterialTheme.typography.labelSmall, color = CyanBiometric)
+                        }
 
                         artifact.elfAnalysis?.let { elf ->
                             Text("ELF : ${elf.machine} | SONAME: ${elf.soName ?: "-"}", style = MaterialTheme.typography.labelSmall, color = CyanBiometric)
                             if (elf.neededLibraries.isNotEmpty()) {
-                                Text("DT_NEEDED : ${elf.neededLibraries.joinToString(", ")}", style = MaterialTheme.typography.labelSmall)
+                                Text("DT_NEEDED (${elf.neededLibraries.size}) : ${elf.neededLibraries.joinToString(", ")}", style = MaterialTheme.typography.labelSmall)
+                            }
+                            if (elf.resolvedDependencies.isNotEmpty()) {
+                                Text(
+                                    text = "Dépendances résolues :\n" + elf.resolvedDependencies.entries.take(15).joinToString("\n") { "  • ${it.key} -> ${it.value}" },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldVerified
+                                )
                             }
                             if (elf.missingLibraries.isNotEmpty()) {
                                 Text("MANQUANTES : ${elf.missingLibraries.joinToString(", ")}", style = MaterialTheme.typography.labelSmall, color = CrimsonCritical)
                             }
-                            if (elf.fodSymbols.isNotEmpty()) {
-                                Text("Symboles FOD : ${elf.fodSymbols.take(20).joinToString(", ")}", style = MaterialTheme.typography.labelSmall, color = EmeraldVerified)
+                            if (elf.exportedSymbols.isNotEmpty()) {
+                                Text("Exportés (.dynsym) : ${elf.exportedSymbols.take(15).joinToString(", ")}", style = MaterialTheme.typography.labelSmall, color = EmeraldVerified)
+                            }
+                            if (elf.importedSymbols.isNotEmpty()) {
+                                Text("Importés (UND) : ${elf.importedSymbols.take(15).joinToString(", ")}", style = MaterialTheme.typography.labelSmall, color = AmberWarning)
                             }
                         }
 
@@ -336,6 +373,38 @@ private fun ArtifactDetailCard(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                        }
+
+                        if (pseudoText.isNotBlank()) {
+                            FilterChip(
+                                selected = showPseudoCode,
+                                onClick = { showPseudoCode = !showPseudoCode },
+                                label = {
+                                    Text(
+                                        if (showPseudoCode) "Masquer quasi-code source" else "Afficher quasi-code source"
+                                    )
+                                }
+                            )
+                            if (showPseudoCode) {
+                                Surface(
+                                    shape = MaterialTheme.shapes.small,
+                                    color = MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(1.dp, CyanBiometric.copy(alpha = 0.35f))
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState())
+                                            .padding(10.dp)
+                                    ) {
+                                        Text(
+                                            text = pseudoText.take(3200),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
