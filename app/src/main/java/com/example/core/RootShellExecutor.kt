@@ -174,6 +174,20 @@ class RootShellExecutor {
         runRaw(command, useRoot = false, timeoutMs = timeoutMs)
     }
 
+    fun startStreamingProcess(
+        command: String,
+        preferRoot: Boolean = true
+    ): Process? {
+        val useRoot = preferRoot && (cachedRootGranted != false)
+        return runCatching {
+            if (useRoot) {
+                ProcessBuilder(resolvedSuBinary, "-c", command).redirectErrorStream(true).start()
+            } else {
+                ProcessBuilder("sh", "-c", command).redirectErrorStream(true).start()
+            }
+        }.getOrNull()
+    }
+
     suspend fun readFileBytesSafe(
         path: String,
         maxBytes: Int = 24 * 1024 * 1024,

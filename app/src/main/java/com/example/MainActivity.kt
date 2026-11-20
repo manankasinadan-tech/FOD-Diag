@@ -16,11 +16,13 @@ import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.CompareArrows
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.Sensors
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.CompareArrows
 import androidx.compose.material.icons.rounded.Dashboard
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Sensors
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -53,6 +55,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.livefod.LiveFodScreen
+import com.example.livefod.LiveFodViewModel
 import com.example.ui.screens.ComparatorScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.HomeScreen
@@ -70,10 +74,11 @@ private enum class LabRoute(
     val testTag: String
 ) {
     ACCUEIL("accueil", "Accueil", Icons.Rounded.Home, Icons.Outlined.Home, "nav_accueil"),
+    LIVE_FOD("live_fod", "Live FOD", Icons.Rounded.Sensors, Icons.Outlined.Sensors, "nav_live_fod"),
     TABLEAU_DE_BORD("tableau_de_bord", "Tableau", Icons.Rounded.Dashboard, Icons.Outlined.Dashboard, "nav_tableau"),
-    CARTOGRAPHIE("cartographie", "Carte FOD", Icons.Rounded.AccountTree, Icons.Outlined.AccountTree, "nav_cartographie"),
+    CARTOGRAPHIE("cartographie", "Carte", Icons.Rounded.AccountTree, Icons.Outlined.AccountTree, "nav_cartographie"),
     COMPARATEUR("comparateur", "Comparer", Icons.Rounded.CompareArrows, Icons.Outlined.CompareArrows, "nav_comparateur"),
-    PARAMETRES("parametres", "Paramètres", Icons.Rounded.Settings, Icons.Outlined.Settings, "nav_parametres")
+    PARAMETRES("parametres", "Réglages", Icons.Rounded.Settings, Icons.Outlined.Settings, "nav_parametres")
 }
 
 class MainActivity : ComponentActivity() {
@@ -82,10 +87,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val viewModel: FodLabViewModel = viewModel()
+            val liveViewModel: LiveFodViewModel = viewModel()
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
             FodLabTheme(darkTheme = uiState.settings.darkTheme) {
-                FodLabApp(viewModel = viewModel)
+                FodLabApp(viewModel = viewModel, liveViewModel = liveViewModel)
             }
         }
     }
@@ -93,8 +99,12 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FodLabApp(viewModel: FodLabViewModel) {
+fun FodLabApp(
+    viewModel: FodLabViewModel,
+    liveViewModel: LiveFodViewModel
+) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val liveUiState by liveViewModel.uiState.collectAsStateWithLifecycle()
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
@@ -112,27 +122,35 @@ fun FodLabApp(viewModel: FodLabViewModel) {
         }
     }
 
+    fun shareZipFile(file: java.io.File) {
+        runCatching {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/zip"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Capture FOD Lab : ${file.name}")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Partager l'archive FOD .zip"))
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.events.collect { event ->
             when (event) {
                 LabUiEvent.NavigateToDashboard -> navigateTo(LabRoute.TABLEAU_DE_BORD.route)
-                is LabUiEvent.ShareZipFile -> {
-                    runCatching {
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            event.file
-                        )
-                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                            type = "application/zip"
-                            putExtra(Intent.EXTRA_STREAM, uri)
-                            putExtra(Intent.EXTRA_SUBJECT, "Capture FOD Lab : ${event.file.name}")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(Intent.createChooser(shareIntent, "Partager l'archive FOD .zip"))
-                    }
-                }
+                is LabUiEvent.ShareZipFile -> shareZipFile(event.file)
             }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        liveViewModel.shareZipEvents.collect { zipFile ->
+            shareZipFile(zipFile)
         }
     }
 
@@ -144,6 +162,14 @@ fun FodLabApp(viewModel: FodLabViewModel) {
         }
     }
 
+    LaunchedEffect(liveUiState.statusMessage, liveUiState.errorMessage) {
+        val msg = liveUiState.errorMessage ?: liveUiState.statusMessage
+        if (!msg.isNullOrBlank()) {
+            snackbarHostState.showSnackbar(msg)
+            liveViewModel.clearMessages()
+        }
+    }
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val useNavRail = maxWidth >= 680.dp
 
@@ -152,6 +178,7 @@ fun FodLabApp(viewModel: FodLabViewModel) {
             topBar = {
                 val activeTitle = when (currentRoute) {
                     LabRoute.ACCUEIL.route -> "FOD Lab Intelligence"
+                    LabRoute.LIVE_FOD.route -> "Live FOD — Interception Temps Réel"
                     LabRoute.TABLEAU_DE_BORD.route -> "Tableau de bord FOD"
                     LabRoute.CARTOGRAPHIE.route -> "Cartographie & Artefacts"
                     LabRoute.COMPARATEUR.route -> "Comparateur Stock vs GSI"
@@ -190,7 +217,9 @@ fun FodLabApp(viewModel: FodLabViewModel) {
                                 label = {
                                     Text(
                                         text = dest.labelFr,
+                                        style = MaterialTheme.typography.labelSmall,
                                         maxLines = 1,
+                                        softWrap = false,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 },
@@ -244,6 +273,27 @@ fun FodLabApp(viewModel: FodLabViewModel) {
                             },
                             onDeleteSnapshot = { snap -> viewModel.deleteSnapshot(snap) },
                             onOpenSettings = { navigateTo(LabRoute.PARAMETRES.route) }
+                        )
+                    }
+
+                    composable(LabRoute.LIVE_FOD.route) {
+                        LiveFodScreen(
+                            uiState = liveUiState,
+                            rootGranted = uiState.envStatus.rootGranted,
+                            onStartCapture = { label -> liveViewModel.startLiveCapture(label) },
+                            onMarkTouch = { liveViewModel.markTouchMoment() },
+                            onStopCapture = { liveViewModel.stopLiveCapture() },
+                            onOpenEnrollSettings = { liveViewModel.openFingerprintEnrollSettings() },
+                            onSelectSession = { s -> liveViewModel.selectSession(s) },
+                            onDeleteSession = { s -> liveViewModel.deleteSession(s) },
+                            onReadSubFile = { s, rel -> liveViewModel.readSubFilePreview(s, rel) },
+                            onImportZipUri = { uri -> liveViewModel.importLiveZip(uri) },
+                            onExportSessionZip = { liveViewModel.exportActiveSessionZip(shareAfter = false) },
+                            onShareSessionZip = { liveViewModel.exportActiveSessionZip(shareAfter = true) },
+                            onSelectComparePair = { a, b -> liveViewModel.selectComparisonPair(a, b) },
+                            onRunCompare = { liveViewModel.runLiveComparison() },
+                            onExportCompareZip = { liveViewModel.exportLiveComparisonZip(shareAfter = false) },
+                            onShareCompareZip = { liveViewModel.exportLiveComparisonZip(shareAfter = true) }
                         )
                     }
 
